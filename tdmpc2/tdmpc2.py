@@ -26,7 +26,7 @@ class TDMPC2(torch.nn.Module):
 			{'params': self.model._reward.parameters()},
 			{'params': self.model._termination.parameters() if self.cfg.episodic else []},
 			{'params': self.model._Qs.parameters()},
-			{'params': self.model._task_emb.parameters() if self.cfg.multitask else []
+			{'params': self.model._ctx_enc.parameters() if self.cfg.multitask else []
 			 }
 		], lr=self.cfg.lr, capturable=True)
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True)
@@ -39,6 +39,13 @@ class TDMPC2(torch.nn.Module):
 		print('Episode length:', cfg.episode_length)
 		print('Discount factor:', self.discount)
 		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
+		if cfg.multitask:
+			# Online context for PEARL-style posterior inference during rollouts
+			ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
+			self._ctx_buf = torch.zeros(cfg.context_window, ctx_dim, device=self.device)
+			self._ctx_count = 0
+			self._z_ctx_mu = torch.zeros(1, cfg.task_dim, device=self.device)
+			self._z_ctx_logvar = torch.zeros(1, cfg.task_dim, device=self.device)
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
 			self._update = torch.compile(self._update, mode="reduce-overhead")
@@ -95,10 +102,45 @@ class TDMPC2(torch.nn.Module):
 		self.model.load_state_dict(state_dict)
 		return
 
+	def _reset_context(self):
+		"""Reset the online context, returning the posterior to the N(0, I) prior."""
+		self._ctx_count = 0
+		self._z_ctx_mu.zero_()
+		self._z_ctx_logvar.zero_()
+
+	@torch.no_grad()
+	def update_context(self, obs, action, reward, next_obs):
+		"""
+		Append a transition to the online context and recompute the
+		posterior q(z|c) over the task latent. Call after each env step.
+
+		Args:
+			obs (torch.Tensor): Observation before the step (padded dims).
+			action (torch.Tensor): Action taken (padded dims).
+			reward (float): Reward received.
+			next_obs (torch.Tensor): Observation after the step (padded dims).
+		"""
+		tup = torch.cat([
+			obs.to(self.device, non_blocking=True).view(-1),
+			action.to(self.device, non_blocking=True).view(-1),
+			torch.as_tensor(reward, dtype=torch.float32, device=self.device).view(1),
+			next_obs.to(self.device, non_blocking=True).view(-1),
+		])
+		self._ctx_buf[self._ctx_count % self.cfg.context_window] = tup
+		self._ctx_count += 1
+		n = min(self._ctx_count, self.cfg.context_window)
+		mask = (torch.arange(self.cfg.context_window, device=self.device) < n).float()
+		mu, logvar = self.model.infer_ctx(self._ctx_buf, mask)
+		self._z_ctx_mu.copy_(mu.unsqueeze(0))
+		self._z_ctx_logvar.copy_(logvar.unsqueeze(0))
+
 	@torch.no_grad()
 	def act(self, obs, t0=False, eval_mode=False, task=None):
 		"""
 		Select an action by planning in the latent space of the world model.
+		In multi-task mode the task latent is inferred from the online context
+		(prior at episode start); `task` is only used for env-side plumbing
+		(action masks and discounts), never as a network input.
 
 		Args:
 			obs (torch.Tensor): Observation from the environment.
@@ -112,32 +154,41 @@ class TDMPC2(torch.nn.Module):
 		obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
 		if task is not None:
 			task = torch.tensor([task], device=self.device)
+		if self.cfg.multitask:
+			if t0:
+				self._reset_context()
+			if eval_mode:
+				z_ctx = self._z_ctx_mu
+			else:
+				z_ctx = self._z_ctx_mu + torch.randn_like(self._z_ctx_mu) * torch.exp(0.5*self._z_ctx_logvar)
+		else:
+			z_ctx = None
 		if self.cfg.mpc:
-			return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task).cpu()
-		z = self.model.encode(obs, task)
-		action, info = self.model.pi(z, task)
+			return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task, z_ctx=z_ctx).cpu()
+		z = self.model.encode(obs, z_ctx)
+		action, info = self.model.pi(z, z_ctx, task)
 		if eval_mode:
 			action = info["mean"]
 		return action[0].cpu()
 
 	@torch.no_grad()
-	def _estimate_value(self, z, actions, task):
+	def _estimate_value(self, z, actions, task, z_ctx):
 		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
 		G, discount = 0, 1
 		termination = torch.zeros(self.cfg.num_samples, 1, dtype=torch.float32, device=z.device)
 		for t in range(self.cfg.horizon):
-			reward = math.two_hot_inv(self.model.reward(z, actions[t], task), self.cfg)
-			z = self.model.next(z, actions[t], task)
+			reward = math.two_hot_inv(self.model.reward(z, actions[t], z_ctx), self.cfg)
+			z = self.model.next(z, actions[t], z_ctx)
 			G = G + discount * (1-termination) * reward
 			discount_update = self.discount[torch.tensor(task)] if self.cfg.multitask else self.discount
 			discount = discount * discount_update
 			if self.cfg.episodic:
-				termination = torch.clip(termination + (self.model.termination(z, task) > 0.5).float(), max=1.)
-		action, _ = self.model.pi(z, task)
-		return G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg')
+				termination = torch.clip(termination + (self.model.termination(z, z_ctx) > 0.5).float(), max=1.)
+		action, _ = self.model.pi(z, z_ctx, task)
+		return G + discount * (1-termination) * self.model.Q(z, action, z_ctx, return_type='avg')
 
 	@torch.no_grad()
-	def _plan(self, obs, t0=False, eval_mode=False, task=None):
+	def _plan(self, obs, t0=False, eval_mode=False, task=None, z_ctx=None):
 		"""
 		Plan a sequence of actions using the learned world model.
 
@@ -145,20 +196,21 @@ class TDMPC2(torch.nn.Module):
 			z (torch.Tensor): Latent state from which to plan.
 			t0 (bool): Whether this is the first observation in the episode.
 			eval_mode (bool): Whether to use the mean of the action distribution.
-			task (Torch.Tensor): Task index (only used for multi-task experiments).
+			task (Torch.Tensor): Task index (only used for action masks and discounts).
+			z_ctx (torch.Tensor): Task latent inferred from the online context.
 
 		Returns:
 			torch.Tensor: Action to take in the environment.
 		"""
 		# Sample policy trajectories
-		z = self.model.encode(obs, task)
+		z = self.model.encode(obs, z_ctx)
 		if self.cfg.num_pi_trajs > 0:
 			pi_actions = torch.empty(self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
 			_z = z.repeat(self.cfg.num_pi_trajs, 1)
 			for t in range(self.cfg.horizon-1):
-				pi_actions[t], _ = self.model.pi(_z, task)
-				_z = self.model.next(_z, pi_actions[t], task)
-			pi_actions[-1], _ = self.model.pi(_z, task)
+				pi_actions[t], _ = self.model.pi(_z, z_ctx, task)
+				_z = self.model.next(_z, pi_actions[t], z_ctx)
+			pi_actions[-1], _ = self.model.pi(_z, z_ctx, task)
 
 		# Initialize state and parameters
 		z = z.repeat(self.cfg.num_samples, 1)
@@ -182,7 +234,7 @@ class TDMPC2(torch.nn.Module):
 				actions = actions * self.model._action_masks[task]
 
 			# Compute elite actions
-			value = self._estimate_value(z, actions, task).nan_to_num(0)
+			value = self._estimate_value(z, actions, task, z_ctx).nan_to_num(0)
 			elite_idxs = torch.topk(value.squeeze(1), self.cfg.num_elites, dim=0).indices
 			elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs]
 
@@ -206,19 +258,20 @@ class TDMPC2(torch.nn.Module):
 		self._prev_mean.copy_(mean)
 		return a.clamp(-1, 1)
 
-	def update_pi(self, zs, task):
+	def update_pi(self, zs, z_ctx, task):
 		"""
 		Update policy using a sequence of latent states.
 
 		Args:
 			zs (torch.Tensor): Sequence of latent states.
-			task (torch.Tensor): Task index (only used for multi-task experiments).
+			z_ctx (torch.Tensor): Task latent (detached, multi-task only).
+			task (torch.Tensor): Task index (only used for action masks).
 
 		Returns:
 			float: Loss of the policy update.
 		"""
-		action, info = self.model.pi(zs, task)
-		qs = self.model.Q(zs, action, task, return_type='avg', detach=True)
+		action, info = self.model.pi(zs, z_ctx, task)
+		qs = self.model.Q(zs, action, z_ctx, return_type='avg', detach=True)
 		self.scale.update(qs[0])
 		qs = self.scale(qs)
 
@@ -240,7 +293,7 @@ class TDMPC2(torch.nn.Module):
 		return info
 
 	@torch.no_grad()
-	def _td_target(self, next_z, reward, terminated, task):
+	def _td_target(self, next_z, reward, terminated, task, z_ctx):
 		"""
 		Compute the TD-target from a reward and the observation at the following time step.
 
@@ -248,40 +301,48 @@ class TDMPC2(torch.nn.Module):
 			next_z (torch.Tensor): Latent state at the following time step.
 			reward (torch.Tensor): Reward at the current time step.
 			terminated (torch.Tensor): Termination signal at the current time step.
-			task (torch.Tensor): Task index (only used for multi-task experiments).
+			task (torch.Tensor): Task index (only used for action masks and discounts).
+			z_ctx (torch.Tensor): Task latent (multi-task only).
 
 		Returns:
 			torch.Tensor: TD-target.
 		"""
-		action, _ = self.model.pi(next_z, task)
+		action, _ = self.model.pi(next_z, z_ctx, task)
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-		return reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)
+		return reward + discount * (1-terminated) * self.model.Q(next_z, action, z_ctx, return_type='min', target=True)
 
-	def _update(self, obs, action, reward, terminated, task=None):
+	def _update(self, obs, action, reward, terminated, task=None, ctx=None):
+		# Infer task latent from context (PEARL-style)
+		if self.cfg.multitask:
+			ctx_mu, ctx_logvar = self.model.infer_ctx(ctx)
+			z_ctx = ctx_mu + torch.randn_like(ctx_mu) * torch.exp(0.5*ctx_logvar)
+		else:
+			z_ctx = None
+
 		# Compute targets
 		with torch.no_grad():
-			next_z = self.model.encode(obs[1:], task)
-			td_targets = self._td_target(next_z, reward, terminated, task)
+			next_z = self.model.encode(obs[1:], z_ctx)
+			td_targets = self._td_target(next_z, reward, terminated, task, z_ctx)
 
 		# Prepare for update
 		self.model.train()
 
 		# Latent rollout
 		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)
-		z = self.model.encode(obs[0], task)
+		z = self.model.encode(obs[0], z_ctx)
 		zs[0] = z
 		consistency_loss = 0
 		for t, (_action, _next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):
-			z = self.model.next(z, _action, task)
+			z = self.model.next(z, _action, z_ctx)
 			consistency_loss = consistency_loss + F.mse_loss(z, _next_z) * self.cfg.rho**t
 			zs[t+1] = z
 
 		# Predictions
 		_zs = zs[:-1]
-		qs = self.model.Q(_zs, action, task, return_type='all')
-		reward_preds = self.model.reward(_zs, action, task)
+		qs = self.model.Q(_zs, action, z_ctx, return_type='all')
+		reward_preds = self.model.reward(_zs, action, z_ctx)
 		if self.cfg.episodic:
-			termination_pred = self.model.termination(zs[1:], task, unnormalized=True)
+			termination_pred = self.model.termination(zs[1:], z_ctx, unnormalized=True)
 
 		# Compute losses
 		reward_loss, value_loss = 0, 0
@@ -297,11 +358,16 @@ class TDMPC2(torch.nn.Module):
 		else:
 			termination_loss = 0.
 		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
+		if self.cfg.multitask:
+			kl_loss = math.gaussian_kl(ctx_mu, ctx_logvar).mean()
+		else:
+			kl_loss = 0.
 		total_loss = (
 			self.cfg.consistency_coef * consistency_loss +
 			self.cfg.reward_coef * reward_loss +
 			self.cfg.termination_coef * termination_loss +
-			self.cfg.value_coef * value_loss
+			self.cfg.value_coef * value_loss +
+			self.cfg.kl_coef * kl_loss
 		)
 
 		# Update model
@@ -311,7 +377,7 @@ class TDMPC2(torch.nn.Module):
 		self.optim.zero_grad(set_to_none=True)
 
 		# Update policy
-		pi_info = self.update_pi(zs.detach(), task)
+		pi_info = self.update_pi(zs.detach(), z_ctx.detach() if z_ctx is not None else None, task)
 
 		# Update target Q-functions
 		self.model.soft_update_target_Q()
@@ -323,6 +389,7 @@ class TDMPC2(torch.nn.Module):
 			"reward_loss": reward_loss,
 			"value_loss": value_loss,
 			"termination_loss": termination_loss,
+			"kl_loss": kl_loss,
 			"total_loss": total_loss,
 			"grad_norm": grad_norm,
 		})
@@ -341,9 +408,10 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			dict: Dictionary of training statistics.
 		"""
-		obs, action, reward, terminated, task = buffer.sample()
+		obs, action, reward, terminated, task, ctx = buffer.sample()
 		kwargs = {}
 		if task is not None:
 			kwargs["task"] = task
+			kwargs["ctx"] = ctx
 		torch.compiler.cudagraph_mark_step_begin()
 		return self._update(obs, action, reward, terminated, **kwargs)

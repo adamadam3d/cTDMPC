@@ -18,7 +18,10 @@ class WorldModel(nn.Module):
 		super().__init__()
 		self.cfg = cfg
 		if cfg.multitask:
-			self._task_emb = nn.Embedding(len(cfg.tasks), cfg.task_dim, max_norm=1)
+			# PEARL-style context encoder: maps (s, a, r, s') tuples to Gaussian factors
+			# that are combined into a posterior q(z|c) via a Product of Gaussians.
+			ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
+			self._ctx_enc = layers.mlp(ctx_dim, 2*[cfg.enc_dim], 2*cfg.task_dim)
 			self.register_buffer("_action_masks", torch.zeros(len(cfg.tasks), cfg.action_dim))
 			for i in range(len(cfg.tasks)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
@@ -85,70 +88,84 @@ class WorldModel(nn.Module):
 		"""
 		self._target_Qs_params.lerp_(self._detach_Qs_params, self.cfg.tau)
 
-	def task_emb(self, x, task):
+	def infer_ctx(self, ctx, mask=None):
 		"""
-		Continuous task embedding for multi-task experiments.
-		Retrieves the task embedding for a given task ID `task`
-		and concatenates it to the input `x`.
-		"""
-		if isinstance(task, int):
-			task = torch.tensor([task], device=x.device)
-		emb = self._task_emb(task.long())
-		if x.ndim == 3:
-			emb = emb.unsqueeze(0).repeat(x.shape[0], 1, 1)
-		elif emb.shape[0] == 1:
-			emb = emb.repeat(x.shape[0], 1)
-		return torch.cat([x, emb], dim=-1)
+		Infers the posterior q(z|c) over the task latent from a set of
+		context transitions (s, a, r, s'), PEARL-style.
 
-	def encode(self, obs, task):
+		Args:
+			ctx (torch.Tensor): Context tuples, shape (..., N, ctx_dim).
+			mask (torch.Tensor): Optional validity mask, shape (..., N).
+				With no valid factors, the posterior reduces to the N(0, I) prior.
+
+		Returns:
+			tuple: Posterior mean and log-variance, each of shape (..., task_dim).
+		"""
+		mus, raw_vars = self._ctx_enc(ctx).chunk(2, dim=-1)
+		return math.product_of_gaussians(mus, raw_vars, mask)
+
+	def concat_ctx(self, x, z_ctx):
+		"""
+		Concatenates the inferred task latent `z_ctx` to the input `x`.
+		Broadcasts over the time dimension when `x` is a sequence.
+		"""
+		if x.ndim == 3:
+			z_ctx = z_ctx.unsqueeze(0).repeat(x.shape[0], 1, 1)
+		elif z_ctx.shape[0] == 1:
+			z_ctx = z_ctx.repeat(x.shape[0], 1)
+		return torch.cat([x, z_ctx], dim=-1)
+
+	def encode(self, obs, z_ctx):
 		"""
 		Encodes an observation into its latent representation.
 		This implementation assumes a single state-based observation.
 		"""
 		if self.cfg.multitask:
-			obs = self.task_emb(obs, task)
+			obs = self.concat_ctx(obs, z_ctx)
 		if self.cfg.obs == 'rgb' and obs.ndim == 5:
 			return torch.stack([self._encoder[self.cfg.obs](o) for o in obs])
 		return self._encoder[self.cfg.obs](obs)
 
-	def next(self, z, a, task):
+	def next(self, z, a, z_ctx):
 		"""
 		Predicts the next latent state given the current latent state and action.
 		"""
 		if self.cfg.multitask:
-			z = self.task_emb(z, task)
+			z = self.concat_ctx(z, z_ctx)
 		z = torch.cat([z, a], dim=-1)
 		return self._dynamics(z)
 
-	def reward(self, z, a, task):
+	def reward(self, z, a, z_ctx):
 		"""
 		Predicts instantaneous (single-step) reward.
 		"""
 		if self.cfg.multitask:
-			z = self.task_emb(z, task)
+			z = self.concat_ctx(z, z_ctx)
 		z = torch.cat([z, a], dim=-1)
 		return self._reward(z)
-	
-	def termination(self, z, task, unnormalized=False):
+
+	def termination(self, z, z_ctx, unnormalized=False):
 		"""
 		Predicts termination signal.
 		"""
-		assert task is None
+		assert z_ctx is None
 		if self.cfg.multitask:
-			z = self.task_emb(z, task)
+			z = self.concat_ctx(z, z_ctx)
 		if unnormalized:
 			return self._termination(z)
 		return torch.sigmoid(self._termination(z))
-		
 
-	def pi(self, z, task):
+
+	def pi(self, z, z_ctx, task=None):
 		"""
 		Samples an action from the policy prior.
 		The policy prior is a Gaussian distribution with
 		mean and (log) std predicted by a neural network.
+		`task` is only used to mask out unused action dimensions
+		(env-side knowledge); the networks are conditioned on `z_ctx` alone.
 		"""
 		if self.cfg.multitask:
-			z = self.task_emb(z, task)
+			z = self.concat_ctx(z, z_ctx)
 
 		# Gaussian policy prior
 		mean, log_std = self._pi(z).chunk(2, dim=-1)
@@ -183,7 +200,7 @@ class WorldModel(nn.Module):
 		})
 		return action, info
 
-	def Q(self, z, a, task, return_type='min', target=False, detach=False):
+	def Q(self, z, a, z_ctx, return_type='min', target=False, detach=False):
 		"""
 		Predict state-action value.
 		`return_type` can be one of [`min`, `avg`, `all`]:
@@ -195,7 +212,7 @@ class WorldModel(nn.Module):
 		assert return_type in {'min', 'avg', 'all'}
 
 		if self.cfg.multitask:
-			z = self.task_emb(z, task)
+			z = self.concat_ctx(z, z_ctx)
 
 		z = torch.cat([z, a], dim=-1)
 		if target:

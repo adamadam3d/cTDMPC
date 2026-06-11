@@ -30,6 +30,40 @@ def squash(mu, pi, log_pi):
 	return mu, pi, log_pi
 
 
+def product_of_gaussians(mus, raw_vars, mask=None):
+	"""
+	Combines per-transition Gaussian factors into a single posterior
+	via a Product of Gaussians (PEARL-style context aggregation).
+	The N(0, I) prior is included as an additional factor, so an empty
+	(or fully masked) context reduces to the prior.
+
+	Args:
+		mus (torch.Tensor): Factor means, shape (..., N, d).
+		raw_vars (torch.Tensor): Unconstrained factor variances, shape (..., N, d).
+			Mapped to positive values with softplus.
+		mask (torch.Tensor): Optional validity mask, shape (..., N) or (..., N, 1).
+			Invalid factors are excluded from the product.
+
+	Returns:
+		tuple: Posterior mean and log-variance, each of shape (..., d).
+	"""
+	var = F.softplus(raw_vars).clamp(min=1e-7)
+	prec = 1. / var
+	if mask is not None:
+		if mask.ndim == mus.ndim - 1:
+			mask = mask.unsqueeze(-1)
+		prec = prec * mask
+	prec_total = 1. + prec.sum(dim=-2) # prior factor: precision 1, mean 0
+	mu = (prec * mus).sum(dim=-2) / prec_total
+	logvar = -torch.log(prec_total)
+	return mu, logvar
+
+
+def gaussian_kl(mu, logvar):
+	"""KL divergence between N(mu, exp(logvar)) and N(0, I), summed over the last dim."""
+	return 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).sum(-1)
+
+
 def int_to_one_hot(x, num_classes):
 	"""
 	Converts an integer tensor to a one-hot tensor.

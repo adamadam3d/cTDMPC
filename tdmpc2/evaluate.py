@@ -78,7 +78,10 @@ def evaluate(cfg: dict):
 				frames = [env.render()]
 			while not done:
 				action = agent.act(obs, t0=t==0, task=task_idx)
+				prev_obs = obs
 				obs, reward, done, info = env.step(action)
+				if cfg.multitask:
+					agent.update_context(prev_obs, action, reward, obs)
 				ep_reward += reward
 				t += 1
 				if cfg.save_video:
