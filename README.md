@@ -1,79 +1,59 @@
-<h1>TD-MPC2</span></h1>
+<h1>cTDMPC: Contextual TD-MPC2</h1>
 
-Official implementation of
+TD-MPC2 with PEARL-style task inference — the learned task embedding is replaced by a probabilistic context encoder, turning multi-task TD-MPC2 into a meta-RL agent that infers the task from experience instead of being told its identity.
 
-[TD-MPC2: Scalable, Robust World Models for Continuous Control](https://www.tdmpc2.com) by
+Built on the official implementation of [TD-MPC2: Scalable, Robust World Models for Continuous Control](https://www.tdmpc2.com) by [Nicklas Hansen](https://nicklashansen.github.io), [Hao Su](https://cseweb.ucsd.edu/~haosu), and [Xiaolong Wang](https://xiaolonw.github.io) (UC San Diego), combined with the task-inference mechanism from [PEARL: Efficient Off-Policy Meta-Reinforcement Learning via Probabilistic Context Variables](https://arxiv.org/abs/1903.08254) (Rakelly et al., 2019).
 
-[Nicklas Hansen](https://nicklashansen.github.io), [Hao Su](https://cseweb.ucsd.edu/~haosu)\*, [Xiaolong Wang](https://xiaolonw.github.io)\* (UC San Diego)</br>
-
-<img src="assets/0.gif" width="12.5%"><img src="assets/1.gif" width="12.5%"><img src="assets/2.gif" width="12.5%"><img src="assets/3.gif" width="12.5%"><img src="assets/4.gif" width="12.5%"><img src="assets/5.gif" width="12.5%"><img src="assets/6.gif" width="12.5%"><img src="assets/7.gif" width="12.5%"></br>
-
-[[Website]](https://www.tdmpc2.com) [[Paper]](https://arxiv.org/abs/2310.16828) [[Models]](https://www.tdmpc2.com/models)  [[Dataset]](https://www.tdmpc2.com/dataset)
+[[TD-MPC2 Website]](https://www.tdmpc2.com) [[TD-MPC2 Paper]](https://arxiv.org/abs/2310.16828) [[PEARL Paper]](https://arxiv.org/abs/1903.08254) [[Dataset]](https://www.tdmpc2.com/dataset)
 
 ----
 
-**Announcement (Apr 2025): support for episodic tasks!**
+## What is different from TD-MPC2?
 
-We have added support for episodic RL (tasks with terminations) in the latest release. This functionality can be enabled with `episodic=true` but remains disabled by default to ensure reproducibility of results across releases.
+Vanilla multi-task TD-MPC2 conditions every component (encoder, dynamics, reward, policy, Q-functions) on a learned embedding `e` looked up by the ground-truth task ID. This fork removes that lookup entirely:
 
-----
+- **Context encoder (MLP + Product of Gaussians).** An MLP maps each context transition `(s, a, r, s')` to a Gaussian factor `(mu_i, sigma_i)`. Factors are combined into a posterior `q(z|c)` via a Product of Gaussians, with the `N(0, I)` prior included as a factor so that an empty context cleanly reduces to the prior.
+- **Task inference, not task identity.** No network ever sees the task ID. All components are conditioned on a latent `z` sampled from `q(z|c)`. The ID survives only for env-side plumbing (action-space masks and per-task discounts) — the standard PEARL assumption that the environment is given while task semantics are hidden.
+- **Training (offline, mt30/mt80).** For each batch element, `num_context` transitions of the same task are sampled independently from the offline dataset. The encoder is trained through all world-model losses (consistency, reward, value) plus a `KL(q(z|c) || N(0, I))` regularizer weighted by `kl_coef`. The latent is detached for the policy update.
+- **Inference (incremental in-episode posterior).** At episode start the agent acts under the prior. After every step, the new transition is appended to an online context FIFO (`context_window`) and the posterior is recomputed — the agent figures out which task it is in *while acting*. Evaluation uses the posterior mean.
 
+New config parameters (see `config.yaml`):
 
-## Overview
+| argument | default | description |
+| --- | --- | --- |
+| `num_context` | 64 | context transitions per batch element during training |
+| `context_window` | 100 | max online context transitions kept during rollout |
+| `kl_coef` | 0.1 | weight of the KL regularizer (PEARL's `kl_lambda`) |
 
-TD-MPC**2** is a scalable, robust model-based reinforcement learning algorithm. It compares favorably to existing model-free and model-based methods across **104** continuous control tasks spanning multiple domains, with a *single* set of hyperparameters (*right*). We further demonstrate the scalability of TD-MPC**2** by training a single 317M parameter agent to perform **80** tasks across multiple domains, embodiments, and action spaces (*left*). 
+Single-task training and evaluation are completely unaffected — all changes are gated behind `multitask=true`.
 
-<img src="assets/8.png" width="100%" style="max-width: 640px"><br/>
-
-This repository contains code for training and evaluating both single-task online RL and multi-task offline RL TD-MPC**2** agents. We additionally open-source **300+** [model checkpoints](https://www.tdmpc2.com/models) (including 12 multi-task models) across 4 task domains: [DMControl](https://arxiv.org/abs/1801.00690), [Meta-World](https://meta-world.github.io/), [ManiSkill2](https://maniskill2.github.io/), and [MyoSuite](https://sites.google.com/view/myosuite), as well as our [30-task and 80-task datasets](https://www.tdmpc2.com/dataset) used to train the multi-task models. Our codebase supports both state and pixel observations. We hope that this repository will serve as a useful community resource for future research on model-based RL.
+**Important:** the official pretrained multi-task TD-MPC2 checkpoints are **not compatible** with this fork (`_task_emb` was removed and `_ctx_enc` added). Multi-task agents must be trained from scratch. Official *single-task* checkpoints remain compatible.
 
 ----
 
 ## Getting started
 
-You will need a machine with a GPU and at least 12 GB of RAM for single-task online RL with TD-MPC**2**, and 128 GB of RAM for multi-task offline RL on our provided 80-task dataset. A GPU with at least 8 GB of memory is recommended for single-task online RL and for evaluation of the provided multi-task models (up to 317M parameters). Training of the 317M parameter model requires a GPU with at least 24 GB of memory.
+You will need a machine with a GPU and at least 12 GB of RAM for single-task online RL, and 128 GB of RAM for multi-task offline RL on the 80-task dataset. A GPU with at least 8 GB of memory is recommended for single-task online RL; larger multi-task models require correspondingly more memory.
 
-We provide a `Dockerfile` for easy installation. You can build the docker image by running
+A `Dockerfile` is provided for easy installation:
 
 ```
 cd docker && docker build . -t <user>/tdmpc2:1.0.1
 ```
 
-This docker image contains all dependencies needed for running DMControl. We also provide a pre-built docker image [here](https://hub.docker.com/repository/docker/nicklashansen/tdmpc2/tags/1.0.1/sha256-b07d4e04d4b28ffd9a63ac18ec1541950e874bb51d276c7d09b36135f170dd93).
-
-If you prefer to use `conda` rather than docker, start by running the following command:
+This docker image contains all dependencies needed for running DMControl. If you prefer `conda`:
 
 ```
 conda env create -f docker/environment.yaml
 ```
 
-The `docker/environment.yaml` file installs dependencies required for training on DMControl tasks. Other domains can be installed by following the instructions in `docker/environment.yaml`.
-
-If you want to run ManiSkill2, you will additionally need to download and link the necessary assets by running
-
-```
-python -m mani_skill2.utils.download_asset all
-```
-
-which downloads assets to `./data`. You may move these assets to any location. Then, add the following line to your `~/.bashrc`:
-
-```
-export MS2_ASSET_DIR=<path>/<to>/<data>
-```
-
-and restart your terminal. Note that Meta-World requires MuJoCo 2.1.0 and `gym==0.21.0` which is becoming increasingly difficult to install. We host the unrestricted MuJoCo 2.1.0 license (courtesy of Google DeepMind) at [https://www.tdmpc2.com/files/mjkey.txt](https://www.tdmpc2.com/files/mjkey.txt). You can download the license by running
-
-```
-wget https://www.tdmpc2.com/files/mjkey.txt -O ~/.mujoco/mjkey.txt
-```
-
-Depending on your existing system packages, you may need to install other dependencies. See `docker/Dockerfile` for a list of recommended system packages.
+The `docker/environment.yaml` file installs dependencies required for training on DMControl tasks. Other domains (Meta-World, ManiSkill2, MyoSuite) can be installed by following the instructions in `docker/environment.yaml`. For ManiSkill2 assets, MuJoCo licensing, and other domain-specific setup, refer to the [upstream TD-MPC2 instructions](https://github.com/nicklashansen/tdmpc2#getting-started).
 
 ----
 
 ## Supported tasks
 
-This codebase provides support for all **104** continuous control tasks from **DMControl**, **Meta-World**, **ManiSkill2**, and **MyoSuite** used in our paper. Specifically, it supports 39 tasks from DMControl (including 11 custom tasks), 50 tasks from Meta-World, 5 tasks from ManiSkill2, and 10 tasks from MyoSuite, and covers all tasks used in the paper. See below table for expected name formatting for each task domain:
+The codebase supports all **104** continuous control tasks from **DMControl**, **Meta-World**, **ManiSkill2**, and **MyoSuite** used in the TD-MPC2 paper. See below table for expected name formatting for each task domain:
 
 | domain | task
 | --- | --- |
@@ -86,69 +66,62 @@ This codebase provides support for all **104** continuous control tasks from **D
 | myosuite  | myo-key-turn
 | myosuite  | myo-key-turn-hard
 
-which can be run by specifying the `task` argument for `evaluation.py`. Multi-task training and evaluation is specified by setting `task=mt80` or `task=mt30` for the 80-task and 30-task sets, respectively. While you generally do not need to access the underlying task IDs or embeddings during training or evaluation of our multi-task models, the mapping from task name to task embedding used in our work can be found [here](https://github.com/nicklashansen/tdmpc2/blob/7ec6bc83a82a5188ca3faddc59aea83f430ab570/tdmpc2/common/__init__.py#L26). As of April 2025, our codebase also provides basic support for other MuJoCo/Box2d Gymnasium tasks; refer to the `envs` directory for a list of tasks. It should be relatively straightforward to add support for custom tasks by following the examples in `envs`.
+Multi-task (meta-RL) training and evaluation is specified by setting `task=mt80` or `task=mt30` for the 80-task and 30-task sets, respectively, and requires downloading the corresponding [offline dataset](https://www.tdmpc2.com/dataset) and setting `data_dir`. Use argument `obs=rgb` for image observations in DMControl tasks (single-task only).
 
-**Note:** we also provide support for image observations in the DMControl tasks. Use argument `obs=rgb` if you wish to train visual policies.
-
+----
 
 ## Example usage
 
-We provide examples on how to evaluate our provided TD-MPC**2** checkpoints, as well as how to train your own TD-MPC**2** agents, below.
-
-### Evaluation
-
-See below examples on how to evaluate downloaded single-task and multi-task checkpoints.
-
-```
-$ python evaluate.py task=mt80 model_size=48 checkpoint=/path/to/mt80-48M.pt
-$ python evaluate.py task=mt30 model_size=317 checkpoint=/path/to/mt30-317M.pt
-$ python evaluate.py task=dog-run checkpoint=/path/to/dog-1.pt save_video=true
-```
-
-All single-task checkpoints expect `model_size=5`. Multi-task checkpoints are available in multiple model sizes. Available arguments are `model_size={1, 5, 19, 48, 317}`. Note that single-task evaluation of multi-task checkpoints is currently not supported. See `config.yaml` for a full list of arguments.
-
 ### Training
 
-See below examples on how to train TD-MPC**2** on a single task (online RL) and on multi-task datasets (offline RL). We recommend configuring [Weights and Biases](https://wandb.ai) (`wandb`) in `config.yaml` to track training progress.
-
 ```
-$ python train.py task=mt80 model_size=48 batch_size=1024
-$ python train.py task=mt30 model_size=317 batch_size=1024
+$ python train.py task=mt80 model_size=48 batch_size=1024 data_dir=/path/to/mt80
+$ python train.py task=mt30 model_size=5 batch_size=256 data_dir=/path/to/mt30
 $ python train.py task=dog-run steps=7000000
 $ python train.py task=walker-walk obs=rgb
 ```
 
-We recommend using default hyperparameters for single-task online RL, including the default model size of 5M parameters (`model_size=5`). Multi-task offline RL benefits from a larger model size, but larger models are also increasingly costly to train and evaluate. Available arguments are `model_size={1, 5, 19, 48, 317}`. See `config.yaml` for a full list of arguments.
+Multi-task runs train the context encoder end-to-end with the world model; the `kl_loss` metric tracks the KL regularizer. We recommend configuring [Weights and Biases](https://wandb.ai) (`wandb`) in `config.yaml` to track training progress.
+
+### Evaluation
+
+```
+$ python evaluate.py task=mt30 model_size=5 checkpoint=/path/to/your-mt30.pt
+$ python evaluate.py task=dog-run checkpoint=/path/to/dog-1.pt save_video=true
+```
+
+During multi-task evaluation the agent starts each episode under the prior and adapts its task belief online from the transitions it observes. Remember that only checkpoints trained with this fork can be evaluated in multi-task mode.
+
+### Tests
+
+CPU unit checks for the context encoder (Product of Gaussians math, posterior inference, masking, per-task context sampling) can be run with:
+
+```
+$ python test_pearl_context.py
+```
 
 ----
 
 ## Citation
 
-If you find our work useful, please consider citing our paper as follows:
+If you build on this fork, please cite the original TD-MPC2 and PEARL papers:
 
 ```
 @inproceedings{hansen2024tdmpc2,
-  title={TD-MPC2: Scalable, Robust World Models for Continuous Control}, 
+  title={TD-MPC2: Scalable, Robust World Models for Continuous Control},
   author={Nicklas Hansen and Hao Su and Xiaolong Wang},
   booktitle={International Conference on Learning Representations (ICLR)},
   year={2024}
 }
 ```
-as well as the original TD-MPC paper:
 ```
-@inproceedings{hansen2022tdmpc,
-  title={Temporal Difference Learning for Model Predictive Control},
-  author={Nicklas Hansen and Xiaolong Wang and Hao Su},
+@inproceedings{rakelly2019pearl,
+  title={Efficient Off-Policy Meta-Reinforcement Learning via Probabilistic Context Variables},
+  author={Kate Rakelly and Aurick Zhou and Deirdre Quillen and Chelsea Finn and Sergey Levine},
   booktitle={International Conference on Machine Learning (ICML)},
-  year={2022}
+  year={2019}
 }
 ```
-
-----
-
-## Contributing
-
-You are very welcome to contribute to this project. Feel free to open an issue or pull request if you have any suggestions or bug reports, but please review our [guidelines](CONTRIBUTING.md) first. Our goal is to build a codebase that can easily be extended to new environments and tasks, and we would love to hear about your experience!
 
 ----
 
