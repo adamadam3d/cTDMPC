@@ -18,10 +18,16 @@ class WorldModel(nn.Module):
 		super().__init__()
 		self.cfg = cfg
 		if cfg.multitask:
-			# PEARL-style context encoder: maps (s, a, r, s') tuples to Gaussian factors
-			# that are combined into a posterior q(z|c) via a Product of Gaussians.
+			# Supervised/contrastive context encoder (baseline, no VAE):
+			# an MLP embeds each (s, a, r, s') tuple, embeddings are mean-pooled
+			# into a deterministic task latent z, and the encoder is trained
+			# directly on task labels (classification head) or with supervised
+			# InfoNCE between windows of the same task.
 			ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
-			self._ctx_enc = layers.mlp(ctx_dim, 2*[cfg.enc_dim], 2*cfg.task_dim)
+			self._ctx_enc = nn.ModuleDict({
+				'enc': layers.mlp(ctx_dim, 2*[cfg.enc_dim], cfg.task_dim),
+				'clf': nn.Linear(cfg.task_dim, len(cfg.tasks)),
+			})
 			self.register_buffer("_action_masks", torch.zeros(len(cfg.tasks), cfg.action_dim))
 			for i in range(len(cfg.tasks)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
@@ -90,19 +96,30 @@ class WorldModel(nn.Module):
 
 	def infer_ctx(self, ctx, mask=None):
 		"""
-		Infers the posterior q(z|c) over the task latent from a set of
-		context transitions (s, a, r, s'), PEARL-style.
+		Infers a deterministic task latent z from a set of context
+		transitions (s, a, r, s') by embedding each tuple and mean-pooling.
 
 		Args:
 			ctx (torch.Tensor): Context tuples, shape (..., N, ctx_dim).
 			mask (torch.Tensor): Optional validity mask, shape (..., N).
-				With no valid factors, the posterior reduces to the N(0, I) prior.
+				With no valid tuples, z reduces to the zero vector.
 
 		Returns:
-			tuple: Posterior mean and log-variance, each of shape (..., task_dim).
+			torch.Tensor: Task latent of shape (..., task_dim).
 		"""
-		mus, raw_vars = self._ctx_enc(ctx).chunk(2, dim=-1)
-		return math.product_of_gaussians(mus, raw_vars, mask)
+		x = self._ctx_enc['enc'](ctx)
+		if mask is not None:
+			if mask.ndim == x.ndim - 1:
+				mask = mask.unsqueeze(-1)
+			x = x * mask
+			n = mask.sum(dim=-2).clamp(min=1)
+		else:
+			n = x.shape[-2]
+		return x.sum(dim=-2) / n
+
+	def classify_ctx(self, z):
+		"""Predict task logits from the task latent (classification variant)."""
+		return self._ctx_enc['clf'](z)
 
 	def concat_ctx(self, x, z_ctx):
 		"""

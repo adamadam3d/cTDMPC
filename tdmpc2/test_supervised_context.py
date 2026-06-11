@@ -1,10 +1,12 @@
 """
-CPU unit checks for the PEARL-style context encoder
-(Product of Gaussians task inference replacing the task embedding).
+CPU unit checks for the supervised/contrastive context encoder baseline
+(deterministic mean-pooled task latent trained with task labels,
+replacing the task embedding; no VAE).
 
-Run with: python test_pearl_context.py
+Run with: python test_supervised_context.py
 """
 import torch
+import torch.nn.functional as F
 from tensordict.tensordict import TensorDict
 
 from common import math
@@ -48,37 +50,54 @@ def make_mt_cfg():
 	)
 
 
-def test_product_of_gaussians():
-	B, N, d = 5, 7, 3
-	mus = torch.randn(B, N, d)
-	raw_vars = torch.randn(B, N, d)
+def test_info_nce():
+	B, d = 8, 16
+	labels = torch.arange(B)
+	z = F.normalize(torch.randn(B, d), dim=-1)
+	# Aligned pairs (positives identical) should give much lower loss than
+	# misaligned pairs (positives shuffled).
+	aligned = math.info_nce(z, z.clone(), labels, temperature=0.1)
+	shuffled = math.info_nce(z, z[torch.randperm(B)], labels, temperature=0.1)
+	assert aligned < shuffled, 'aligned positives should have lower loss'
 
-	# Fully masked context reduces to the N(0, I) prior
-	mu, logvar = math.product_of_gaussians(mus, raw_vars, torch.zeros(B, N))
-	assert torch.allclose(mu, torch.zeros(B, d), atol=1e-6)
-	assert torch.allclose(logvar, torch.zeros(B, d), atol=1e-6)
+	# Same-label masking: a duplicate-label element whose embedding equals
+	# the anchor must not act as a negative (loss stays low).
+	labels_dup = labels.clone()
+	labels_dup[1] = labels_dup[0]
+	z_dup = z.clone()
+	z_dup[1] = z_dup[0]
+	masked = math.info_nce(z_dup, z_dup.clone(), labels_dup, temperature=0.1)
+	assert torch.isfinite(masked) and masked < shuffled, \
+		'same-label duplicates must be masked out of the negatives'
+	print('info_nce: OK')
 
-	# More context factors -> higher precision -> lower variance
-	_, logvar_few = math.product_of_gaussians(mus, raw_vars, (torch.arange(N) < 2).float().expand(B, N))
-	_, logvar_many = math.product_of_gaussians(mus, raw_vars, torch.ones(B, N))
-	assert (logvar_many < logvar_few).all()
 
-	# Masked product equals product over the unmasked subset
+def test_infer_ctx():
+	cfg = make_mt_cfg()
+	model = WorldModel(cfg)
+	model.eval()
+	B, N = 6, 10
+	ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
+	ctx = torch.randn(B, N, ctx_dim)
+
+	z = model.infer_ctx(ctx)
+	assert z.shape == (B, cfg.task_dim)
+
+	# Fully masked context -> zero latent (the "uninformed" state at t0)
+	z0 = model.infer_ctx(torch.randn(N, ctx_dim), torch.zeros(N))
+	assert torch.allclose(z0, torch.zeros(cfg.task_dim))
+
+	# Masked mean equals the mean over the unmasked subset
 	mask = torch.zeros(B, N)
 	mask[:, :3] = 1.
-	mu_m, logvar_m = math.product_of_gaussians(mus, raw_vars, mask)
-	mu_s, logvar_s = math.product_of_gaussians(mus[:, :3], raw_vars[:, :3])
-	assert torch.allclose(mu_m, mu_s, atol=1e-5)
-	assert torch.allclose(logvar_m, logvar_s, atol=1e-5)
-	print('product_of_gaussians: OK')
+	z_m = model.infer_ctx(ctx, mask)
+	z_s = model.infer_ctx(ctx[:, :3])
+	assert torch.allclose(z_m, z_s, atol=1e-5)
 
-
-def test_gaussian_kl():
-	mu = torch.zeros(4, 3)
-	logvar = torch.zeros(4, 3)
-	assert torch.allclose(math.gaussian_kl(mu, logvar), torch.zeros(4), atol=1e-6)
-	assert (math.gaussian_kl(torch.randn(4, 3) + 2., logvar) > 0).all()
-	print('gaussian_kl: OK')
+	# Classification head
+	logits = model.classify_ctx(z)
+	assert logits.shape == (B, len(cfg.tasks))
+	print('infer_ctx + classify_ctx: OK')
 
 
 def test_world_model_multitask():
@@ -86,19 +105,9 @@ def test_world_model_multitask():
 	model = WorldModel(cfg)
 	B, N = 6, 10
 	ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
-
-	# Posterior inference shapes
-	ctx = torch.randn(B, N, ctx_dim)
-	mu, logvar = model.infer_ctx(ctx)
-	assert mu.shape == (B, cfg.task_dim) and logvar.shape == (B, cfg.task_dim)
-
-	# Fully masked online context (single trajectory layout) -> prior
-	mu0, logvar0 = model.infer_ctx(torch.randn(N, ctx_dim), torch.zeros(N))
-	assert torch.allclose(mu0, torch.zeros(cfg.task_dim), atol=1e-6)
-	assert torch.allclose(logvar0, torch.zeros(cfg.task_dim), atol=1e-6)
+	z_ctx = model.infer_ctx(torch.randn(B, N, ctx_dim))
 
 	# Forward passes conditioned on z_ctx
-	z_ctx = mu
 	obs = torch.randn(B, cfg.obs_shape['state'][0])
 	z = model.encode(obs, z_ctx)
 	assert z.shape == (B, cfg.latent_dim)
@@ -196,9 +205,9 @@ def test_buffer_context_sampling():
 
 if __name__ == '__main__':
 	torch.manual_seed(0)
-	test_product_of_gaussians()
-	test_gaussian_kl()
+	test_info_nce()
+	test_infer_ctx()
 	test_world_model_multitask()
 	test_world_model_singletask()
 	test_buffer_context_sampling()
-	print('\nAll PEARL context checks passed.')
+	print('\nAll supervised-context checks passed.')

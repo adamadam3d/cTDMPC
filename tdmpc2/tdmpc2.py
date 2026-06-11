@@ -40,12 +40,11 @@ class TDMPC2(torch.nn.Module):
 		print('Discount factor:', self.discount)
 		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
 		if cfg.multitask:
-			# Online context for PEARL-style posterior inference during rollouts
+			# Online context for task-latent inference during rollouts
 			ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
 			self._ctx_buf = torch.zeros(cfg.context_window, ctx_dim, device=self.device)
 			self._ctx_count = 0
-			self._z_ctx_mu = torch.zeros(1, cfg.task_dim, device=self.device)
-			self._z_ctx_logvar = torch.zeros(1, cfg.task_dim, device=self.device)
+			self._z_ctx = torch.zeros(1, cfg.task_dim, device=self.device)
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
 			self._update = torch.compile(self._update, mode="reduce-overhead")
@@ -103,16 +102,15 @@ class TDMPC2(torch.nn.Module):
 		return
 
 	def _reset_context(self):
-		"""Reset the online context, returning the posterior to the N(0, I) prior."""
+		"""Reset the online context, returning the task latent to zero."""
 		self._ctx_count = 0
-		self._z_ctx_mu.zero_()
-		self._z_ctx_logvar.zero_()
+		self._z_ctx.zero_()
 
 	@torch.no_grad()
 	def update_context(self, obs, action, reward, next_obs):
 		"""
 		Append a transition to the online context and recompute the
-		posterior q(z|c) over the task latent. Call after each env step.
+		task latent z. Call after each env step.
 
 		Args:
 			obs (torch.Tensor): Observation before the step (padded dims).
@@ -130,9 +128,8 @@ class TDMPC2(torch.nn.Module):
 		self._ctx_count += 1
 		n = min(self._ctx_count, self.cfg.context_window)
 		mask = (torch.arange(self.cfg.context_window, device=self.device) < n).float()
-		mu, logvar = self.model.infer_ctx(self._ctx_buf, mask)
-		self._z_ctx_mu.copy_(mu.unsqueeze(0))
-		self._z_ctx_logvar.copy_(logvar.unsqueeze(0))
+		z = self.model.infer_ctx(self._ctx_buf, mask)
+		self._z_ctx.copy_(z.unsqueeze(0))
 
 	@torch.no_grad()
 	def act(self, obs, t0=False, eval_mode=False, task=None):
@@ -157,10 +154,7 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.multitask:
 			if t0:
 				self._reset_context()
-			if eval_mode:
-				z_ctx = self._z_ctx_mu
-			else:
-				z_ctx = self._z_ctx_mu + torch.randn_like(self._z_ctx_mu) * torch.exp(0.5*self._z_ctx_logvar)
+			z_ctx = self._z_ctx
 		else:
 			z_ctx = None
 		if self.cfg.mpc:
@@ -311,11 +305,10 @@ class TDMPC2(torch.nn.Module):
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		return reward + discount * (1-terminated) * self.model.Q(next_z, action, z_ctx, return_type='min', target=True)
 
-	def _update(self, obs, action, reward, terminated, task=None, ctx=None):
-		# Infer task latent from context (PEARL-style)
+	def _update(self, obs, action, reward, terminated, task=None, ctx=None, ctx2=None):
+		# Infer deterministic task latent from context
 		if self.cfg.multitask:
-			ctx_mu, ctx_logvar = self.model.infer_ctx(ctx)
-			z_ctx = ctx_mu + torch.randn_like(ctx_mu) * torch.exp(0.5*ctx_logvar)
+			z_ctx = self.model.infer_ctx(ctx)
 		else:
 			z_ctx = None
 
@@ -359,15 +352,25 @@ class TDMPC2(torch.nn.Module):
 			termination_loss = 0.
 		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
 		if self.cfg.multitask:
-			kl_loss = math.gaussian_kl(ctx_mu, ctx_logvar).mean()
+			# Supervised context loss: task classification or supervised
+			# InfoNCE against an independent window of the same task.
+			if self.cfg.context_loss == 'nce':
+				z_ctx2 = self.model.infer_ctx(ctx2)
+				context_loss = math.info_nce(z_ctx, z_ctx2, task, self.cfg.nce_temp)
+				context_acc = 0.
+			else:
+				task_logits = self.model.classify_ctx(z_ctx)
+				context_loss = F.cross_entropy(task_logits, task)
+				context_acc = (task_logits.argmax(-1) == task).float().mean()
 		else:
-			kl_loss = 0.
+			context_loss = 0.
+			context_acc = 0.
 		total_loss = (
 			self.cfg.consistency_coef * consistency_loss +
 			self.cfg.reward_coef * reward_loss +
 			self.cfg.termination_coef * termination_loss +
 			self.cfg.value_coef * value_loss +
-			self.cfg.kl_coef * kl_loss
+			self.cfg.context_coef * context_loss
 		)
 
 		# Update model
@@ -389,7 +392,8 @@ class TDMPC2(torch.nn.Module):
 			"reward_loss": reward_loss,
 			"value_loss": value_loss,
 			"termination_loss": termination_loss,
-			"kl_loss": kl_loss,
+			"context_loss": context_loss,
+			"context_acc": context_acc,
 			"total_loss": total_loss,
 			"grad_norm": grad_norm,
 		})
@@ -413,5 +417,8 @@ class TDMPC2(torch.nn.Module):
 		if task is not None:
 			kwargs["task"] = task
 			kwargs["ctx"] = ctx
+			if self.cfg.context_loss == 'nce':
+				# Independent second window per task for contrastive positives
+				kwargs["ctx2"] = buffer.sample_context(task)
 		torch.compiler.cudagraph_mark_step_begin()
 		return self._update(obs, action, reward, terminated, **kwargs)
