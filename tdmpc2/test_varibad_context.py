@@ -1,8 +1,9 @@
 """
-CPU unit checks for the PEARL-style context encoder
-(Product of Gaussians task inference replacing the task embedding).
+CPU unit checks for the VariBAD-style recurrent context encoder
+(GRU belief inference over the latent task variable, replacing the
+task embedding).
 
-Run with: python test_pearl_context.py
+Run with: python test_varibad_context.py
 """
 import torch
 from tensordict.tensordict import TensorDict
@@ -48,37 +49,54 @@ def make_mt_cfg():
 	)
 
 
-def test_product_of_gaussians():
-	B, N, d = 5, 7, 3
-	mus = torch.randn(B, N, d)
-	raw_vars = torch.randn(B, N, d)
-
-	# Fully masked context reduces to the N(0, I) prior
-	mu, logvar = math.product_of_gaussians(mus, raw_vars, torch.zeros(B, N))
-	assert torch.allclose(mu, torch.zeros(B, d), atol=1e-6)
-	assert torch.allclose(logvar, torch.zeros(B, d), atol=1e-6)
-
-	# More context factors -> higher precision -> lower variance
-	_, logvar_few = math.product_of_gaussians(mus, raw_vars, (torch.arange(N) < 2).float().expand(B, N))
-	_, logvar_many = math.product_of_gaussians(mus, raw_vars, torch.ones(B, N))
-	assert (logvar_many < logvar_few).all()
-
-	# Masked product equals product over the unmasked subset
-	mask = torch.zeros(B, N)
-	mask[:, :3] = 1.
-	mu_m, logvar_m = math.product_of_gaussians(mus, raw_vars, mask)
-	mu_s, logvar_s = math.product_of_gaussians(mus[:, :3], raw_vars[:, :3])
-	assert torch.allclose(mu_m, mu_s, atol=1e-5)
-	assert torch.allclose(logvar_m, logvar_s, atol=1e-5)
-	print('product_of_gaussians: OK')
+def test_gaussian_kl_pair():
+	mu = torch.randn(4, 3)
+	logvar = torch.randn(4, 3)
+	# KL between identical Gaussians is zero
+	assert torch.allclose(math.gaussian_kl_pair(mu, logvar, mu, logvar), torch.zeros(4), atol=1e-6)
+	# KL against the N(0, I) prior matches the specialized helper
+	zeros = torch.zeros_like(mu)
+	assert torch.allclose(
+		math.gaussian_kl_pair(mu, logvar, zeros, zeros),
+		math.gaussian_kl(mu, logvar), atol=1e-5)
+	assert (math.gaussian_kl_pair(mu + 3., logvar, mu, logvar) > 0).all()
+	print('gaussian_kl_pair: OK')
 
 
-def test_gaussian_kl():
-	mu = torch.zeros(4, 3)
-	logvar = torch.zeros(4, 3)
-	assert torch.allclose(math.gaussian_kl(mu, logvar), torch.zeros(4), atol=1e-6)
-	assert (math.gaussian_kl(torch.randn(4, 3) + 2., logvar) > 0).all()
-	print('gaussian_kl: OK')
+def test_belief_rollout():
+	cfg = make_mt_cfg()
+	model = WorldModel(cfg)
+	model.eval()
+	B, N = 6, 10
+	ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
+	ctx = torch.randn(B, N, ctx_dim)
+
+	beliefs = model.belief_rollout(ctx)
+	assert beliefs.shape == (B, N+1, cfg.task_dim)
+	# Index 0 is the N(0, I) prior belief [mu=0, logvar=0]
+	assert torch.allclose(beliefs[:, 0], torch.zeros(B, cfg.task_dim))
+	# Beliefs depend on the order of the context (recurrent, not a set encoder)
+	perm = torch.randperm(N)
+	beliefs_perm = model.belief_rollout(ctx[:, perm])
+	assert not torch.allclose(beliefs[:, -1], beliefs_perm[:, -1], atol=1e-4)
+	print('belief_rollout: OK')
+
+
+def test_online_offline_consistency():
+	"""Step-by-step belief_update must match the batched belief_rollout."""
+	cfg = make_mt_cfg()
+	model = WorldModel(cfg)
+	model.eval()
+	N = 8
+	ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
+	ctx = torch.randn(1, N, ctx_dim)
+
+	beliefs = model.belief_rollout(ctx)
+	h = torch.zeros(1, 1, cfg.enc_dim)
+	for t in range(N):
+		belief_t, h = model.belief_update(ctx[:, t], h)
+		assert torch.allclose(belief_t, beliefs[:, t+1], atol=1e-5), f'mismatch at step {t}'
+	print('online/offline belief consistency: OK')
 
 
 def test_world_model_multitask():
@@ -86,19 +104,10 @@ def test_world_model_multitask():
 	model = WorldModel(cfg)
 	B, N = 6, 10
 	ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
+	beliefs = model.belief_rollout(torch.randn(B, N, ctx_dim))
+	z_ctx = beliefs[:, -1]
 
-	# Posterior inference shapes
-	ctx = torch.randn(B, N, ctx_dim)
-	mu, logvar = model.infer_ctx(ctx)
-	assert mu.shape == (B, cfg.task_dim) and logvar.shape == (B, cfg.task_dim)
-
-	# Fully masked online context (single trajectory layout) -> prior
-	mu0, logvar0 = model.infer_ctx(torch.randn(N, ctx_dim), torch.zeros(N))
-	assert torch.allclose(mu0, torch.zeros(cfg.task_dim), atol=1e-6)
-	assert torch.allclose(logvar0, torch.zeros(cfg.task_dim), atol=1e-6)
-
-	# Forward passes conditioned on z_ctx
-	z_ctx = mu
+	# Forward passes conditioned on the belief
 	obs = torch.randn(B, cfg.obs_shape['state'][0])
 	z = model.encode(obs, z_ctx)
 	assert z.shape == (B, cfg.latent_dim)
@@ -191,14 +200,19 @@ def test_buffer_context_sampling():
 	assert torch.allclose(r, expected*10), 'context reward belongs to wrong task'
 	assert torch.allclose(s.div(1000).floor(), expected), 'context obs belongs to wrong task'
 	assert torch.allclose(s_next - s, torch.ones_like(s)), 's and s\' are not adjacent steps'
-	print('buffer context sampling: OK')
+	# Windows must be temporally ordered and contiguous within an episode
+	assert torch.allclose(s[:, 1:] - s[:, :-1], torch.ones_like(s[:, 1:])), \
+		'window steps are not consecutive'
+	assert torch.allclose(s_next[:, :-1], s[:, 1:]), 's\'(t) != s(t+1) within window'
+	print('buffer context sampling (ordered windows): OK')
 
 
 if __name__ == '__main__':
 	torch.manual_seed(0)
-	test_product_of_gaussians()
-	test_gaussian_kl()
+	test_gaussian_kl_pair()
+	test_belief_rollout()
+	test_online_offline_consistency()
 	test_world_model_multitask()
 	test_world_model_singletask()
 	test_buffer_context_sampling()
-	print('\nAll PEARL context checks passed.')
+	print('\nAll VariBAD context checks passed.')

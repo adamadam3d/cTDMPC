@@ -64,6 +64,20 @@ def gaussian_kl(mu, logvar):
 	return 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).sum(-1)
 
 
+def gaussian_kl_pair(mu_q, logvar_q, mu_p, logvar_p):
+	"""
+	KL divergence between two diagonal Gaussians KL(q || p), summed over the
+	last dim. Used for VariBAD's sequential KL, where the prior for the belief
+	at step t is the belief at step t-1.
+	"""
+	return 0.5 * (
+		logvar_p - logvar_q
+		+ (logvar_q - logvar_p).exp()
+		+ (mu_q - mu_p).pow(2) * (-logvar_p).exp()
+		- 1
+	).sum(-1)
+
+
 def int_to_one_hot(x, num_classes):
 	"""
 	Converts an integer tensor to a one-hot tensor.

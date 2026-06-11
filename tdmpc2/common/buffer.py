@@ -112,31 +112,35 @@ class Buffer():
 
 	def _build_ctx_index(self):
 		"""
-		Build a flat per-task index over storage rows for context sampling.
-		Valid rows are non-episode-first steps, so that row `i` holds
-		(a, r, s'=obs_i) and row `i-1` holds s=obs_{i-1} of the same episode.
+		Build a flat per-task index of valid context-window start rows.
+		A start row `i` is valid if rows i-1 .. i+N-1 all belong to the same
+		episode, so the window yields N temporally ordered (s, a, r, s') tuples
+		with s taken from the preceding row.
 		"""
+		N = self.cfg.num_context
 		storage = self._buffer._storage
 		n = len(storage)
 		td = storage[:n]
 		episode = td.get('episode').view(n).long()
 		task = td.get('task').view(n).long()
-		valid = torch.zeros(n, dtype=torch.bool, device=episode.device)
-		valid[1:] = episode[1:] == episode[:-1]
-		rows = valid.nonzero(as_tuple=True)[0]
-		order = torch.argsort(task[rows], stable=True)
-		self._ctx_rows = rows[order].to(torch.int32)
-		counts = torch.bincount(task[rows], minlength=len(self.cfg.tasks))
+		starts = torch.arange(1, n - N + 1, device=episode.device)
+		starts = starts[episode[starts-1] == episode[starts+N-1]]
+		assert len(starts) > 0, \
+			f'No valid context windows of length {N}; reduce num_context below the episode length.'
+		order = torch.argsort(task[starts], stable=True)
+		self._ctx_rows = starts[order].to(torch.int32)
+		counts = torch.bincount(task[starts], minlength=len(self.cfg.tasks))
 		self._ctx_offsets = torch.cat([torch.zeros(1, dtype=torch.int64, device=counts.device), counts.cumsum(0)])
 
 	def sample_context(self, tasks, num_context=None):
 		"""
-		Sample `num_context` (s, a, r, s') context tuples per task in `tasks`,
-		drawn uniformly from the data of that task.
+		Sample one temporally ordered within-episode window of `num_context`
+		(s, a, r, s') tuples per task in `tasks`, drawn uniformly from the
+		data of that task.
 
 		Args:
 			tasks (torch.Tensor): Task IDs of shape (B,).
-			num_context (int): Context transitions per batch element.
+			num_context (int): Context window length.
 
 		Returns:
 			torch.Tensor: Context batch of shape (B, num_context, ctx_dim).
@@ -144,12 +148,15 @@ class Buffer():
 		if self._ctx_rows is None:
 			self._build_ctx_index()
 		num_context = num_context or self.cfg.num_context
+		assert num_context == self.cfg.num_context, \
+			'Context index was built for num_context windows; cannot sample a different length.'
 		device = self._ctx_offsets.device
 		tasks = tasks.to(device).long()
 		starts = self._ctx_offsets[tasks]
 		counts = self._ctx_offsets[tasks+1] - starts
-		rand = torch.floor(torch.rand(tasks.shape[0], num_context, device=device) * counts.unsqueeze(1)).long()
-		rows = self._ctx_rows[(starts.unsqueeze(1) + rand).view(-1)].long()
+		rand = torch.floor(torch.rand(tasks.shape[0], device=device) * counts).long()
+		start_rows = self._ctx_rows[starts + rand].long()
+		rows = (start_rows.unsqueeze(1) + torch.arange(num_context, device=device)).view(-1)
 		storage = self._buffer._storage
 		td_t = storage[rows]
 		td_p = storage[rows-1]

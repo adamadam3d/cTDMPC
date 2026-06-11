@@ -40,12 +40,10 @@ class TDMPC2(torch.nn.Module):
 		print('Discount factor:', self.discount)
 		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
 		if cfg.multitask:
-			# Online context for PEARL-style posterior inference during rollouts
-			ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
-			self._ctx_buf = torch.zeros(cfg.context_window, ctx_dim, device=self.device)
-			self._ctx_count = 0
-			self._z_ctx_mu = torch.zeros(1, cfg.task_dim, device=self.device)
-			self._z_ctx_logvar = torch.zeros(1, cfg.task_dim, device=self.device)
+			# Online recurrent belief state for VariBAD-style task inference:
+			# GRU hidden state carried across the episode, belief = [mu, logvar].
+			self._ctx_h = torch.zeros(1, 1, cfg.enc_dim, device=self.device)
+			self._belief = torch.zeros(1, cfg.task_dim, device=self.device)
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
 			self._update = torch.compile(self._update, mode="reduce-overhead")
@@ -103,16 +101,15 @@ class TDMPC2(torch.nn.Module):
 		return
 
 	def _reset_context(self):
-		"""Reset the online context, returning the posterior to the N(0, I) prior."""
-		self._ctx_count = 0
-		self._z_ctx_mu.zero_()
-		self._z_ctx_logvar.zero_()
+		"""Reset the online belief to the N(0, I) prior and clear the GRU state."""
+		self._ctx_h.zero_()
+		self._belief.zero_()
 
 	@torch.no_grad()
 	def update_context(self, obs, action, reward, next_obs):
 		"""
-		Append a transition to the online context and recompute the
-		posterior q(z|c) over the task latent. Call after each env step.
+		Feed a transition through the recurrent context encoder and update
+		the belief over the latent task variable. Call after each env step.
 
 		Args:
 			obs (torch.Tensor): Observation before the step (padded dims).
@@ -125,22 +122,20 @@ class TDMPC2(torch.nn.Module):
 			action.to(self.device, non_blocking=True).view(-1),
 			torch.as_tensor(reward, dtype=torch.float32, device=self.device).view(1),
 			next_obs.to(self.device, non_blocking=True).view(-1),
-		])
-		self._ctx_buf[self._ctx_count % self.cfg.context_window] = tup
-		self._ctx_count += 1
-		n = min(self._ctx_count, self.cfg.context_window)
-		mask = (torch.arange(self.cfg.context_window, device=self.device) < n).float()
-		mu, logvar = self.model.infer_ctx(self._ctx_buf, mask)
-		self._z_ctx_mu.copy_(mu.unsqueeze(0))
-		self._z_ctx_logvar.copy_(logvar.unsqueeze(0))
+		]).unsqueeze(0)
+		belief, h = self.model.belief_update(tup, self._ctx_h)
+		self._ctx_h.copy_(h)
+		self._belief.copy_(belief)
 
 	@torch.no_grad()
 	def act(self, obs, t0=False, eval_mode=False, task=None):
 		"""
 		Select an action by planning in the latent space of the world model.
-		In multi-task mode the task latent is inferred from the online context
-		(prior at episode start); `task` is only used for env-side plumbing
-		(action masks and discounts), never as a network input.
+		In multi-task mode the networks are conditioned on the current belief
+		[mu, logvar] over the latent task variable (prior at episode start),
+		so planning is Bayes-adaptive: the planner sees its own task
+		uncertainty. `task` is only used for env-side plumbing (action masks
+		and discounts), never as a network input.
 
 		Args:
 			obs (torch.Tensor): Observation from the environment.
@@ -157,10 +152,7 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.multitask:
 			if t0:
 				self._reset_context()
-			if eval_mode:
-				z_ctx = self._z_ctx_mu
-			else:
-				z_ctx = self._z_ctx_mu + torch.randn_like(self._z_ctx_mu) * torch.exp(0.5*self._z_ctx_logvar)
+			z_ctx = self._belief
 		else:
 			z_ctx = None
 		if self.cfg.mpc:
@@ -312,10 +304,15 @@ class TDMPC2(torch.nn.Module):
 		return reward + discount * (1-terminated) * self.model.Q(next_z, action, z_ctx, return_type='min', target=True)
 
 	def _update(self, obs, action, reward, terminated, task=None, ctx=None):
-		# Infer task latent from context (PEARL-style)
+		# Infer beliefs over the latent task variable (VariBAD-style)
 		if self.cfg.multitask:
-			ctx_mu, ctx_logvar = self.model.infer_ctx(ctx)
-			z_ctx = ctx_mu + torch.randn_like(ctx_mu) * torch.exp(0.5*ctx_logvar)
+			beliefs = self.model.belief_rollout(ctx)
+			# Condition on the belief after a random number of context steps
+			# (including 0 = prior). This exposes the world model to the full
+			# spectrum of belief widths encountered online, approximating
+			# VariBAD's trajectory decoding from the posterior at every step.
+			t_idx = torch.randint(0, beliefs.shape[1], (beliefs.shape[0],), device=beliefs.device)
+			z_ctx = beliefs.gather(1, t_idx.view(-1, 1, 1).expand(-1, 1, beliefs.shape[-1])).squeeze(1)
 		else:
 			z_ctx = None
 
@@ -359,7 +356,11 @@ class TDMPC2(torch.nn.Module):
 			termination_loss = 0.
 		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
 		if self.cfg.multitask:
-			kl_loss = math.gaussian_kl(ctx_mu, ctx_logvar).mean()
+			# Sequential KL: each belief is regularized towards the previous
+			# one, with the initial prior set to N(0, I) (VariBAD).
+			mus, logvars = beliefs.chunk(2, dim=-1)
+			kl_loss = math.gaussian_kl_pair(
+				mus[:, 1:], logvars[:, 1:], mus[:, :-1], logvars[:, :-1]).mean()
 		else:
 			kl_loss = 0.
 		total_loss = (

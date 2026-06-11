@@ -41,9 +41,8 @@ min_std: 0.05
 max_std: 2
 temperature: 0.5
 
-# context (PEARL)
+# context (VariBAD)
 num_context: 64
-context_window: 100
 kl_coef: 0.1
 
 # actor

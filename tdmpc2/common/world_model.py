@@ -18,10 +18,18 @@ class WorldModel(nn.Module):
 		super().__init__()
 		self.cfg = cfg
 		if cfg.multitask:
-			# PEARL-style context encoder: maps (s, a, r, s') tuples to Gaussian factors
-			# that are combined into a posterior q(z|c) via a Product of Gaussians.
+			# VariBAD-style recurrent context encoder: a GRU processes context
+			# transitions (s, a, r, s') in temporal order and parameterizes a
+			# posterior q(m | tau_{:t}) over the latent task variable at every
+			# step. Networks are conditioned on the belief b_t = [mu_t, logvar_t],
+			# so the latent task variable has dimension task_dim // 2.
+			assert cfg.task_dim % 2 == 0, 'task_dim must be even (belief is [mu, logvar])'
 			ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
-			self._ctx_enc = layers.mlp(ctx_dim, 2*[cfg.enc_dim], 2*cfg.task_dim)
+			self._ctx_enc = nn.ModuleDict({
+				'embed': layers.NormedLinear(ctx_dim, cfg.enc_dim),
+				'gru': nn.GRU(cfg.enc_dim, cfg.enc_dim, batch_first=True),
+				'head': nn.Linear(cfg.enc_dim, cfg.task_dim),
+			})
 			self.register_buffer("_action_masks", torch.zeros(len(cfg.tasks), cfg.action_dim))
 			for i in range(len(cfg.tasks)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
@@ -88,21 +96,44 @@ class WorldModel(nn.Module):
 		"""
 		self._target_Qs_params.lerp_(self._detach_Qs_params, self.cfg.tau)
 
-	def infer_ctx(self, ctx, mask=None):
+	def _belief(self, hidden):
+		"""Project GRU hidden states to belief vectors [mu, logvar]."""
+		mu, logvar = self._ctx_enc['head'](hidden).chunk(2, dim=-1)
+		return torch.cat([mu, logvar.clamp(-10, 2)], dim=-1)
+
+	def belief_rollout(self, ctx):
 		"""
-		Infers the posterior q(z|c) over the task latent from a set of
-		context transitions (s, a, r, s'), PEARL-style.
+		Encodes a temporally ordered context window with the recurrent encoder
+		and returns the per-step beliefs over the latent task variable, with
+		the N(0, I) prior belief prepended at index 0 (VariBAD-style).
 
 		Args:
-			ctx (torch.Tensor): Context tuples, shape (..., N, ctx_dim).
-			mask (torch.Tensor): Optional validity mask, shape (..., N).
-				With no valid factors, the posterior reduces to the N(0, I) prior.
+			ctx (torch.Tensor): Context tuples in temporal order, shape (B, N, ctx_dim).
 
 		Returns:
-			tuple: Posterior mean and log-variance, each of shape (..., task_dim).
+			torch.Tensor: Belief sequence [mu, logvar], shape (B, N+1, task_dim).
 		"""
-		mus, raw_vars = self._ctx_enc(ctx).chunk(2, dim=-1)
-		return math.product_of_gaussians(mus, raw_vars, mask)
+		x = self._ctx_enc['embed'](ctx)
+		x, _ = self._ctx_enc['gru'](x)
+		beliefs = self._belief(x)
+		prior = torch.zeros_like(beliefs[:, :1])
+		return torch.cat([prior, beliefs], dim=1)
+
+	def belief_update(self, tup, h):
+		"""
+		One-step recurrent belief update for online inference.
+
+		Args:
+			tup (torch.Tensor): Single context tuple, shape (B, ctx_dim).
+			h (torch.Tensor): GRU hidden state, shape (1, B, enc_dim).
+
+		Returns:
+			tuple: Updated belief [mu, logvar] of shape (B, task_dim),
+				and the new hidden state.
+		"""
+		x = self._ctx_enc['embed'](tup).unsqueeze(1)
+		x, h = self._ctx_enc['gru'](x, h)
+		return self._belief(x[:, -1]), h
 
 	def concat_ctx(self, x, z_ctx):
 		"""
