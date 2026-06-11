@@ -24,7 +24,7 @@ class Buffer():
 		)
 		self._batch_size = cfg.batch_size * (cfg.horizon+1)
 		self._num_eps = 0
-		self._ctx_rows = None
+		self._ctx_eps = None
 
 	@property
 	def capacity(self):
@@ -112,27 +112,37 @@ class Buffer():
 
 	def _build_ctx_index(self):
 		"""
-		Build a flat per-task index over storage rows for context sampling.
-		Valid rows are non-episode-first steps, so that row `i` holds
-		(a, r, s'=obs_i) and row `i-1` holds s=obs_{i-1} of the same episode.
+		Build a per-task episode index for context sampling. Relies on the
+		offline dataset layout: fixed-length episodes stored contiguously
+		(enforced by OfflineTrainer._load_dataset). Episode-level indexing
+		keeps the memory footprint negligible (a few MB) even for datasets
+		with hundreds of millions of steps.
 		"""
 		storage = self._buffer._storage
 		n = len(storage)
 		td = storage[:n]
-		episode = td.get('episode').view(n).long()
-		task = td.get('task').view(n).long()
-		valid = torch.zeros(n, dtype=torch.bool, device=episode.device)
-		valid[1:] = episode[1:] == episode[:-1]
-		rows = valid.nonzero(as_tuple=True)[0]
-		order = torch.argsort(task[rows], stable=True)
-		self._ctx_rows = rows[order].to(torch.int32)
-		counts = torch.bincount(task[rows], minlength=len(self.cfg.tasks))
+		episode = td.get('episode').view(n)
+		ep_len = int(torch.searchsorted(episode, episode[0], right=True))
+		assert n % ep_len == 0, \
+			f'Expected fixed-length episodes, got {n} steps with first episode of length {ep_len}.'
+		ep_ids = episode[::ep_len]
+		assert (episode[ep_len-1::ep_len] == ep_ids).all() and (ep_ids[1:] > ep_ids[:-1]).all(), \
+			'Context sampling expects fixed-length episodes stored contiguously.'
+		ep_task = td.get('task').view(n)[::ep_len].long()
+		order = torch.argsort(ep_task, stable=True)
+		self._ctx_eps = order.to(torch.int32)
+		counts = torch.bincount(ep_task, minlength=len(self.cfg.tasks))
+		assert (counts > 0).all(), \
+			'Every task in cfg.tasks needs at least one episode for context sampling.'
 		self._ctx_offsets = torch.cat([torch.zeros(1, dtype=torch.int64, device=counts.device), counts.cumsum(0)])
+		self._ctx_ep_len = ep_len
 
 	def sample_context(self, tasks, num_context=None):
 		"""
 		Sample `num_context` (s, a, r, s') context tuples per task in `tasks`,
-		drawn uniformly from the data of that task.
+		drawn uniformly from the data of that task (uniform episode, then
+		uniform non-first row; identical to uniform over all transitions
+		since episodes have equal length).
 
 		Args:
 			tasks (torch.Tensor): Task IDs of shape (B,).
@@ -141,15 +151,19 @@ class Buffer():
 		Returns:
 			torch.Tensor: Context batch of shape (B, num_context, ctx_dim).
 		"""
-		if self._ctx_rows is None:
+		if self._ctx_eps is None:
 			self._build_ctx_index()
 		num_context = num_context or self.cfg.num_context
+		ep_len = self._ctx_ep_len
 		device = self._ctx_offsets.device
 		tasks = tasks.to(device).long()
 		starts = self._ctx_offsets[tasks]
 		counts = self._ctx_offsets[tasks+1] - starts
-		rand = torch.floor(torch.rand(tasks.shape[0], num_context, device=device) * counts.unsqueeze(1)).long()
-		rows = self._ctx_rows[(starts.unsqueeze(1) + rand).view(-1)].long()
+		ep_rand = torch.floor(torch.rand(tasks.shape[0], num_context, device=device) * counts.unsqueeze(1)).long()
+		eps = self._ctx_eps[(starts.unsqueeze(1) + ep_rand).view(-1)].long()
+		# Row offset >= 1 so the preceding row (s) is in the same episode
+		j = torch.randint(1, ep_len, (eps.shape[0],), device=device)
+		rows = eps*ep_len + j
 		storage = self._buffer._storage
 		td_t = storage[rows]
 		td_p = storage[rows-1]
