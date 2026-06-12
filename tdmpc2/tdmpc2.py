@@ -76,6 +76,35 @@ class TDMPC2(torch.nn.Module):
 		frac = episode_length/self.cfg.discount_denom
 		return min(max((frac-1)/(frac), self.cfg.discount_min), self.cfg.discount_max)
 
+	def _named_optim_state(self, optim):
+		"""Convert optimizer state from positional to name-keyed, for robust checkpointing."""
+		param_to_name = {p: n for n, p in self.model.named_parameters()}
+		state = {}
+		for group in optim.param_groups:
+			for p in group['params']:
+				if p in optim.state:
+					state[param_to_name[p]] = optim.state[p]
+		return state
+
+	def _load_named_optim_state(self, optim, named_state):
+		"""Restore name-keyed optimizer state, validating shapes."""
+		name_to_param = dict(self.model.named_parameters())
+		optim_params = {p for group in optim.param_groups for p in group['params']}
+		for name, s in named_state.items():
+			p = name_to_param.get(name)
+			if p is None:
+				raise KeyError(f'Optimizer state for unknown parameter: {name}')
+			if p not in optim_params:
+				print(f'WARNING: skipping optimizer state for {name} (not in this optimizer; config changed?)')
+				continue
+			for k, v in s.items():
+				if torch.is_tensor(v) and v.ndim > 0 and v.shape != p.shape:
+					raise ValueError(
+						f'Optimizer state shape mismatch for {name} ({k}): '
+						f'{tuple(v.shape)} vs {tuple(p.shape)}')
+			optim.state[p] = {k: v.to(p.device) if torch.is_tensor(v) else v
+							  for k, v in s.items()}
+
 	def save(self, fp, step=None):
 		"""
 		Save state dict of the agent to filepath.
@@ -84,38 +113,60 @@ class TDMPC2(torch.nn.Module):
 			fp (str): Filepath to save state dict to.
 			step (int): Optional step/iteration to save.
 		"""
-		payload = {"model": self.model.state_dict()}
+		payload = {
+			"model": self.model.state_dict(),
+			"scale": self.scale.state_dict(),
+			"cfg_check": {
+				"model_size": self.cfg.get("model_size", None),
+				"episodic": self.cfg.get("episodic", None),
+				"multitask": self.cfg.get("multitask", None),
+			},
+		}
 		if hasattr(self, 'optim'):
-			payload["optim"] = self.optim.state_dict()
+			payload["optim_named"] = self._named_optim_state(self.optim)
 		if hasattr(self, 'pi_optim'):
-			payload["pi_optim"] = self.pi_optim.state_dict()
+			payload["pi_optim_named"] = self._named_optim_state(self.pi_optim)
 		if step is not None:
 			payload["step"] = step
 		torch.save(payload, fp)
 
-	def load(self, fp):
+	def load(self, fp, resume=False):
 		"""
 		Load a saved state dict from filepath (or dictionary) into current agent.
 
 		Args:
 			fp (str or dict): Filepath or state dict to load.
+			resume (bool): Also restore optimizer/scale state to resume training.
 		"""
 		if isinstance(fp, dict):
 			state_dict = fp
 		else:
 			state_dict = torch.load(fp, map_location=torch.get_default_device(), weights_only=False)
-		
-		if "optim" in state_dict and hasattr(self, 'optim'):
-			self.optim.load_state_dict(state_dict["optim"])
-		if "pi_optim" in state_dict and hasattr(self, 'pi_optim'):
-			self.pi_optim.load_state_dict(state_dict["pi_optim"])
-		
-		step = state_dict.get("step", 0)
 
 		model_state_dict = state_dict["model"] if "model" in state_dict else state_dict
 		model_state_dict = api_model_conversion(self.model.state_dict(), model_state_dict)
 		self.model.load_state_dict(model_state_dict)
-		return step
+
+		if resume:
+			cfg_check = state_dict.get("cfg_check", None)
+			if cfg_check is not None:
+				for key, saved in cfg_check.items():
+					current = self.cfg.get(key, None)
+					if saved is not None and saved != current:
+						raise ValueError(
+							f'Checkpoint was saved with {key}={saved}, '
+							f'but current run has {key}={current}.')
+			if "optim_named" in state_dict:
+				if hasattr(self, 'optim'):
+					self._load_named_optim_state(self.optim, state_dict["optim_named"])
+				if hasattr(self, 'pi_optim') and "pi_optim_named" in state_dict:
+					self._load_named_optim_state(self.pi_optim, state_dict["pi_optim_named"])
+			else:
+				print('Checkpoint has no name-keyed optimizer state — resuming weights only.')
+			if "scale" in state_dict:
+				self.scale.load_state_dict(state_dict["scale"])
+
+		return state_dict.get("step", 0)
 
 	def _reset_context(self):
 		"""Reset the online context, returning the task latent to zero."""
