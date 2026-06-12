@@ -75,14 +75,22 @@ class TDMPC2(torch.nn.Module):
 		frac = episode_length/self.cfg.discount_denom
 		return min(max((frac-1)/(frac), self.cfg.discount_min), self.cfg.discount_max)
 
-	def save(self, fp):
+	def save(self, fp, step=None):
 		"""
 		Save state dict of the agent to filepath.
 
 		Args:
 			fp (str): Filepath to save state dict to.
+			step (int): Optional step/iteration to save.
 		"""
-		torch.save({"model": self.model.state_dict()}, fp)
+		payload = {"model": self.model.state_dict()}
+		if hasattr(self, 'optim'):
+			payload["optim"] = self.optim.state_dict()
+		if hasattr(self, 'pi_optim'):
+			payload["pi_optim"] = self.pi_optim.state_dict()
+		if step is not None:
+			payload["step"] = step
+		torch.save(payload, fp)
 
 	def load(self, fp):
 		"""
@@ -95,10 +103,18 @@ class TDMPC2(torch.nn.Module):
 			state_dict = fp
 		else:
 			state_dict = torch.load(fp, map_location=torch.get_default_device(), weights_only=False)
-		state_dict = state_dict["model"] if "model" in state_dict else state_dict
-		state_dict = api_model_conversion(self.model.state_dict(), state_dict)
-		self.model.load_state_dict(state_dict)
-		return
+		
+		if "optim" in state_dict and hasattr(self, 'optim'):
+			self.optim.load_state_dict(state_dict["optim"])
+		if "pi_optim" in state_dict and hasattr(self, 'pi_optim'):
+			self.pi_optim.load_state_dict(state_dict["pi_optim"])
+		
+		step = state_dict.get("step", 0)
+
+		model_state_dict = state_dict["model"] if "model" in state_dict else state_dict
+		model_state_dict = api_model_conversion(self.model.state_dict(), model_state_dict)
+		self.model.load_state_dict(model_state_dict)
+		return step
 
 	def _reset_context(self):
 		"""Reset the online belief to the N(0, I) prior and clear the GRU state."""
