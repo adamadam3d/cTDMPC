@@ -76,7 +76,7 @@ class OnlineTrainer(Trainer):
 		
 		if getattr(self.cfg, 'checkpoint', None) and self.cfg.checkpoint != '???':
 			print(f"Resuming from checkpoint: {self.cfg.checkpoint}")
-			self._step = self.agent.load(self.cfg.checkpoint)
+			self._step = self.agent.load(self.cfg.checkpoint, resume=True)
 			print(f"Resuming from iteration {self._step}")
 
 		train_metrics, done, eval_next = {}, True, False
