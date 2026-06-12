@@ -72,9 +72,15 @@ class OfflineTrainer(Trainer):
 			'Offline training only supports multitask training with mt30 or mt80 task sets.'
 		self._load_dataset()
 		
+		start_step = 0
+		if getattr(self.cfg, 'checkpoint', None) and self.cfg.checkpoint != '???':
+			print(f"Resuming from checkpoint: {self.cfg.checkpoint}")
+			start_step = self.agent.load(self.cfg.checkpoint)
+			print(f"Resuming from iteration {start_step}")
+
 		print(f'Training agent for {self.cfg.steps} iterations...')
 		metrics = {}
-		for i in range(self.cfg.steps):
+		for i in range(start_step, self.cfg.steps):
 
 			# Update agent
 			train_metrics = self.agent.update(self.buffer)
@@ -90,7 +96,7 @@ class OfflineTrainer(Trainer):
 					metrics.update(self.eval())
 					self.logger.pprint_multitask(metrics, self.cfg)
 					if i > 0:
-						self.logger.save_agent(self.agent, identifier=f'{i}')
+						self.logger.save_agent(self.agent, identifier=f'{i}', step=i)
 				self.logger.log(metrics, 'pretrain')
 			
 		self.logger.finish(self.agent)
