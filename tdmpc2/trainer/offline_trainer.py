@@ -75,7 +75,7 @@ class OfflineTrainer(Trainer):
 		start_step = 0
 		if getattr(self.cfg, 'checkpoint', None) and self.cfg.checkpoint != '???':
 			print(f"Resuming from checkpoint: {self.cfg.checkpoint}")
-			start_step = self.agent.load(self.cfg.checkpoint)
+			start_step = self.agent.load(self.cfg.checkpoint, resume=True)
 			print(f"Resuming from iteration {start_step}")
 
 		print(f'Training agent for {self.cfg.steps} iterations...')
