@@ -151,10 +151,10 @@ class Logger:
 	def model_dir(self):
 		return self._model_dir
 
-	def save_agent(self, agent=None, identifier='final'):
+	def save_agent(self, agent=None, identifier='final', step=None):
 		if self._save_agent and agent:
 			fp = self._model_dir / f'{str(identifier)}.pt'
-			agent.save(fp)
+			agent.save(fp, step=step)
 			if self._wandb:
 				artifact = self._wandb.Artifact(
 					self._group + '-' + str(self._seed) + '-' + str(identifier),
