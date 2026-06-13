@@ -99,4 +99,4 @@ class OfflineTrainer(Trainer):
 						self.logger.save_agent(self.agent, identifier=f'{i}', step=i)
 				self.logger.log(metrics, 'pretrain')
 			
-		self.logger.finish(self.agent)
+		self.logger.finish(self.agent, step=self.cfg.steps)

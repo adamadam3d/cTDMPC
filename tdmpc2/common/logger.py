@@ -164,9 +164,9 @@ class Logger:
 				artifact.add_file(fp)
 				self._wandb.log_artifact(artifact)
 
-	def finish(self, agent=None):
+	def finish(self, agent=None, step=None):
 		try:
-			self.save_agent(agent)
+			self.save_agent(agent, step=step)
 		except Exception as e:
 			print(colored(f"Failed to save model: {e}", "red"))
 		if self._wandb:
