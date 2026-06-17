@@ -82,6 +82,31 @@ class Buffer():
 		self._num_eps += num_new_eps
 		return self._num_eps
 
+	def save(self, fp):
+		"""
+		Persist the buffer contents to `fp` so training can resume with the
+		exact replay data. Returns False if there is nothing to save.
+		"""
+		if self._num_eps == 0:
+			return False
+		storage = self._buffer._storage
+		n = len(storage)
+		td = storage[:n].cpu()
+		torch.save({'data': td, 'num_eps': self._num_eps}, fp)
+		return True
+
+	def load_state(self, fp):
+		"""
+		Restore buffer contents previously saved with `save`. Rebuilds the
+		underlying storage and continues episode indexing where it left off.
+		"""
+		payload = torch.load(fp, map_location='cpu', weights_only=False)
+		td = payload['data']
+		self._buffer = self._init(td)
+		self._buffer.extend(td)
+		self._num_eps = int(payload['num_eps'])
+		return self._num_eps
+
 	def add(self, td):
 		"""Add an episode to the buffer."""
 		td['episode'] = torch.full_like(td['reward'], self._num_eps, dtype=torch.int64)
