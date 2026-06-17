@@ -1,8 +1,10 @@
+from pathlib import Path
 from time import time
 
 import numpy as np
 import torch
 from tensordict.tensordict import TensorDict
+from termcolor import colored
 from trainer.base import Trainer
 
 
@@ -13,6 +15,7 @@ class OnlineTrainer(Trainer):
 		super().__init__(*args, **kwargs)
 		self._step = 0
 		self._ep_idx = 0
+		self._tds = None
 		self._start_time = time()
 
 	def common_metrics(self):
@@ -51,6 +54,12 @@ class OnlineTrainer(Trainer):
 			episode_length= np.nanmean(ep_lengths),
 		)
 
+	@staticmethod
+	def _buffer_path(checkpoint):
+		"""Path of the replay buffer file stored alongside a model checkpoint."""
+		p = Path(checkpoint)
+		return p.with_name(f'{p.stem}_buffer{p.suffix}')
+
 	def to_td(self, obs, action=None, reward=None, terminated=None):
 		"""Creates a TensorDict for a new episode."""
 		if isinstance(obs, dict):
@@ -74,10 +83,25 @@ class OnlineTrainer(Trainer):
 	def train(self):
 		"""Train a TD-MPC2 agent."""
 		
+		seed_until = self.cfg.seed_steps
 		if getattr(self.cfg, 'checkpoint', None) and self.cfg.checkpoint != '???':
 			print(f"Resuming from checkpoint: {self.cfg.checkpoint}")
 			self._step = self.agent.load(self.cfg.checkpoint, resume=True)
 			print(f"Resuming from iteration {self._step}")
+			# Restore the replay buffer if it was saved alongside the checkpoint,
+			# so training resumes with the exact collected experience. Otherwise
+			# fall back to re-seeding the (empty) buffer before resuming updates,
+			# so we never sample from an empty buffer.
+			buffer_fp = self._buffer_path(self.cfg.checkpoint)
+			if buffer_fp.exists():
+				num_eps = self.buffer.load_state(buffer_fp)
+				self._ep_idx = self.buffer.num_eps
+				print(f"Restored replay buffer with {num_eps} episodes from {buffer_fp}")
+			else:
+				seed_until = self._step + self.cfg.seed_steps
+				print(colored(
+					f"No saved buffer found at {buffer_fp}; re-seeding until step {seed_until}.",
+					"yellow"))
 
 		train_metrics, done, eval_next = {}, True, False
 		while self._step <= self.cfg.steps:
@@ -93,7 +117,7 @@ class OnlineTrainer(Trainer):
 					self.logger.log(eval_metrics, 'eval')
 					eval_next = False
 
-				if self._step > 0:
+				if self._tds is not None:
 					if info['terminated'] and not self.cfg.episodic:
 						raise ValueError('Termination detected but you are not in episodic mode. ' \
 						'Set `episodic=true` to enable support for terminations.')
@@ -110,7 +134,7 @@ class OnlineTrainer(Trainer):
 				self._tds = [self.to_td(obs)]
 
 			# Collect experience
-			if self._step > self.cfg.seed_steps:
+			if self._step > seed_until:
 				action = self.agent.act(obs, t0=len(self._tds)==1)
 			else:
 				action = self.env.rand_act()
@@ -118,8 +142,8 @@ class OnlineTrainer(Trainer):
 			self._tds.append(self.to_td(obs, action, reward, info['terminated']))
 
 			# Update agent
-			if self._step >= self.cfg.seed_steps:
-				if self._step == self.cfg.seed_steps:
+			if self._step >= seed_until:
+				if self._step == seed_until:
 					num_updates = self.cfg.seed_steps
 					print('Pretraining agent on seed data...')
 				else:
@@ -131,3 +155,13 @@ class OnlineTrainer(Trainer):
 			self._step += 1
 
 		self.logger.finish(self.agent)
+
+		# Persist the replay buffer next to the model checkpoint so the run can
+		# be resumed faithfully (skipped if checkpointing is disabled).
+		if self.cfg.save_agent:
+			buffer_fp = self._buffer_path(self.logger.model_dir / 'final.pt')
+			try:
+				if self.buffer.save(buffer_fp):
+					print(f"Saved replay buffer to {buffer_fp}")
+			except Exception as e:
+				print(colored(f"Failed to save replay buffer: {e}", "red"))
