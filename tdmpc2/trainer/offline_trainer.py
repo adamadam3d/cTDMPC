@@ -22,7 +22,9 @@ class OfflineTrainer(Trainer):
 	def eval(self):
 		"""Evaluate a TD-MPC2 agent."""
 		results = dict()
+		scores = []
 		for task_idx in tqdm(range(len(self.cfg.tasks)), desc='Evaluating'):
+			task = self.cfg.tasks[task_idx]
 			ep_rewards, ep_successes = [], []
 			for _ in range(self.cfg.eval_episodes):
 				obs, done, ep_reward, t = self.env.reset(task_idx), False, 0, 0
@@ -36,9 +38,19 @@ class OfflineTrainer(Trainer):
 					t += 1
 				ep_rewards.append(ep_reward)
 				ep_successes.append(info['success'])
+			ep_reward, ep_success = np.nanmean(ep_rewards), np.nanmean(ep_successes)
 			results.update({
-				f'episode_reward+{self.cfg.tasks[task_idx]}': np.nanmean(ep_rewards),
-				f'episode_success+{self.cfg.tasks[task_idx]}': np.nanmean(ep_successes),})
+				f'episode_reward+{task}': ep_reward,
+				f'episode_success+{task}': ep_success,})
+			# Per-task normalized score (success for Meta-World, reward/10 otherwise),
+			# matching the convention used by evaluate.py.
+			scores.append(ep_success*100 if task.startswith('mw-') else ep_reward/10)
+		# Aggregate and plateau-monitoring statistics over the normalized scores.
+		scores = np.array(scores, dtype=np.float64)
+		results['score'] = float(np.nanmean(scores))
+		results['score_min'] = float(np.nanmin(scores))
+		k = min(5, len(scores))
+		results[f'score_bottom{k}'] = float(np.sort(scores)[:k].mean())
 		return results
 	
 	def _load_dataset(self):
@@ -94,6 +106,8 @@ class OfflineTrainer(Trainer):
 				metrics.update(train_metrics)
 				if i % self.cfg.eval_freq == 0:
 					metrics.update(self.eval())
+					if self.cfg.get('log_grad_conflict', True):
+						metrics.update(self.agent.grad_conflict(self.buffer))
 					self.logger.pprint_multitask(metrics, self.cfg)
 					if i > 0:
 						self.logger.save_agent(self.agent, identifier=f'{i}', step=i)

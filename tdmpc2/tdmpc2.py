@@ -1,3 +1,5 @@
+import random
+
 import torch
 import torch.nn.functional as F
 
@@ -462,6 +464,14 @@ class TDMPC2(torch.nn.Module):
 		})
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]))
+		if self.cfg.multitask:
+			# Context-posterior diagnostics: average posterior std (-> 0 as the
+			# context becomes identifiable, -> 1 as it falls back to the prior)
+			# and the typical magnitude of the inferred context mean.
+			info.update(TensorDict({
+				"ctx_post_std": torch.exp(0.5*ctx_logvar).mean(),
+				"ctx_mu_norm": ctx_mu.norm(dim=-1).mean(),
+			}))
 		info.update(pi_info)
 		return info.detach().mean()
 
@@ -482,3 +492,121 @@ class TDMPC2(torch.nn.Module):
 			kwargs["ctx"] = ctx
 		torch.compiler.cudagraph_mark_step_begin()
 		return self._update(obs, action, reward, terminated, **kwargs)
+
+	def _model_loss(self, obs, action, reward, terminated, task, ctx):
+		"""
+		Scalar world-model loss for a (sub-)batch, used only as a diagnostic by
+		`grad_conflict`. Mirrors the world-model terms of `_update` (consistency,
+		reward, value, context KL) but performs no optimiser or policy update and
+		runs eagerly (it is never compiled). The termination term is omitted; it
+		is inactive for the non-episodic multitask suites this is used on.
+		"""
+		ctx_mu, ctx_logvar = self.model.infer_ctx(ctx)
+		z_ctx = ctx_mu + torch.randn_like(ctx_mu) * torch.exp(0.5*ctx_logvar)
+		with torch.no_grad():
+			next_z = self.model.encode(obs[1:], z_ctx)
+			td_targets = self._td_target(next_z, reward, terminated, task, z_ctx)
+		zs = [self.model.encode(obs[0], z_ctx)]
+		consistency_loss = 0
+		for t, (_action, _next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):
+			zs.append(self.model.next(zs[-1], _action, z_ctx))
+			consistency_loss = consistency_loss + F.mse_loss(zs[-1], _next_z) * self.cfg.rho**t
+		zs = torch.stack(zs, 0)
+		_zs = zs[:-1]
+		qs = self.model.Q(_zs, action, z_ctx, return_type='all')
+		reward_preds = self.model.reward(_zs, action, z_ctx)
+		reward_loss, value_loss = 0, 0
+		for t, (rew_pred, rew, td_target, qs_t) in enumerate(zip(
+				reward_preds.unbind(0), reward.unbind(0), td_targets.unbind(0), qs.unbind(1))):
+			reward_loss = reward_loss + math.soft_ce(rew_pred, rew, self.cfg).mean() * self.cfg.rho**t
+			for qs_t_q in qs_t.unbind(0):
+				value_loss = value_loss + math.soft_ce(qs_t_q, td_target, self.cfg).mean() * self.cfg.rho**t
+		consistency_loss = consistency_loss / self.cfg.horizon
+		reward_loss = reward_loss / self.cfg.horizon
+		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
+		kl_loss = math.gaussian_kl(ctx_mu, ctx_logvar).mean()
+		return (
+			self.cfg.consistency_coef * consistency_loss +
+			self.cfg.reward_coef * reward_loss +
+			self.cfg.value_coef * value_loss +
+			self.cfg.kl_coef * kl_loss
+		)
+
+	@staticmethod
+	def _pair_cos(G):
+		"""Pairwise cosine similarities (upper triangle) between rows of `G`."""
+		Gn = F.normalize(G, dim=1)
+		cos = Gn @ Gn.t()
+		n = cos.shape[0]
+		iu = torch.triu_indices(n, n, offset=1, device=cos.device)
+		return cos[iu[0], iu[1]]
+
+	def grad_conflict(self, buffer, max_tasks=None):
+		"""
+		Measure destructive gradient interference between tasks (multitask only).
+
+		Samples a batch and computes the world-model gradient separately for each
+		of up to `max_tasks` tasks present in the batch, over the *full* set of
+		parameters updated by the world-model loss (encoder, dynamics, reward,
+		value/Q, and context encoder -- i.e. every shared component except the
+		policy prior, which is trained by a separate objective, and the
+		no-grad target/detach Q copies). It reports the fraction of task pairs
+		whose gradients have negative cosine similarity and the mean pairwise
+		cosine, both overall and broken down per module (so one can see *where*
+		tasks interfere). A high conflict fraction is direct evidence of negative
+		transfer. Cheap enough to call at every evaluation; returns {} when not
+		applicable. Does not modify optimiser state.
+		"""
+		if not self.cfg.multitask:
+			return {}
+		max_tasks = max_tasks or self.cfg.get('grad_conflict_tasks', 6)
+		obs, action, reward, terminated, task, ctx = buffer.sample()
+		# Per-module parameter groups updated by the world-model loss, in a fixed
+		# order, with the contiguous index range each occupies in the flat vector.
+		modules = [
+			('encoder', self.model._encoder),
+			('dynamics', self.model._dynamics),
+			('reward', self.model._reward),
+			('Q', self.model._Qs),
+			('ctx', self.model._ctx_enc),
+		]
+		params, ranges, off = [], {}, 0
+		for name, mod in modules:
+			ps = [p for p in mod.parameters() if p.requires_grad]
+			n = sum(p.numel() for p in ps)
+			ranges[name] = (off, off + n)
+			off += n
+			params += ps
+		# Group batch indices by task, keeping only tasks with >= 2 samples.
+		groups = []
+		for ti in task.unique().tolist():
+			idx = (task == ti).nonzero(as_tuple=True)[0]
+			if idx.numel() >= 2:
+				groups.append(idx)
+		if len(groups) < 2:
+			return {}
+		random.shuffle(groups)
+		groups = groups[:max_tasks]
+		grads = []
+		for idx in groups:
+			loss = self._model_loss(
+				obs[:, idx], action[:, idx], reward[:, idx], terminated[:, idx],
+				task[idx], ctx[idx])
+			g = torch.autograd.grad(loss, params, allow_unused=True)
+			grads.append(torch.cat([
+				(gi if gi is not None else torch.zeros_like(p)).reshape(-1)
+				for gi, p in zip(g, params)]))
+		G = torch.stack(grads, 0)
+		# Overall conflict over the full world-model gradient.
+		pair_cos = self._pair_cos(G)
+		out = {
+			'grad_conflict_frac': (pair_cos < 0).float().mean().item(),
+			'grad_cos_mean': pair_cos.mean().item(),
+			'grad_conflict_ntasks': float(G.shape[0]),
+		}
+		# Per-module breakdown: where do the tasks fight?
+		for name, (lo, hi) in ranges.items():
+			pc = self._pair_cos(G[:, lo:hi])
+			out[f'grad_conflict_frac/{name}'] = (pc < 0).float().mean().item()
+			out[f'grad_cos_mean/{name}'] = pc.mean().item()
+		return out

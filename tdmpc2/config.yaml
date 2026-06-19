@@ -46,6 +46,10 @@ num_context: 64
 context_window: 100
 kl_coef: 0.1
 
+# diagnostics / logging
+log_grad_conflict: true   # measure per-task gradient conflict at each eval (multitask only)
+grad_conflict_tasks: 6    # number of tasks sampled per gradient-conflict measurement
+
 # actor
 log_std_min: -10
 log_std_max: 2
