@@ -46,6 +46,10 @@ num_context: 64
 context_window: 100
 context_loss: ce # ce (task classification) or nce (supervised InfoNCE, CORRO-style)
 context_coef: 1.0
+
+# diagnostics / logging
+log_grad_conflict: true   # measure per-task gradient conflict at each eval (multitask only)
+grad_conflict_tasks: 6    # number of tasks sampled per gradient-conflict measurement
 nce_temp: 0.1
 
 # actor
