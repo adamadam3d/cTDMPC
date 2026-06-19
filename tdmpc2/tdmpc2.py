@@ -42,12 +42,21 @@ class TDMPC2(torch.nn.Module):
 		print('Discount factor:', self.discount)
 		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
 		if cfg.multitask:
-			# Online context for PEARL-style posterior inference during rollouts
+			# Online context state for inference during rollouts, per encoder.
 			ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
-			self._ctx_buf = torch.zeros(cfg.context_window, ctx_dim, device=self.device)
-			self._ctx_count = 0
-			self._z_ctx_mu = torch.zeros(1, cfg.task_dim, device=self.device)
-			self._z_ctx_logvar = torch.zeros(1, cfg.task_dim, device=self.device)
+			if cfg.context_encoder == 'varibad':
+				# Recurrent belief: GRU hidden state carried across the episode.
+				self._ctx_h = torch.zeros(1, 1, cfg.enc_dim, device=self.device)
+				self._belief = torch.zeros(1, cfg.task_dim, device=self.device)
+			else:
+				# pearl / supervised: a rolling buffer of recent transitions.
+				self._ctx_buf = torch.zeros(cfg.context_window, ctx_dim, device=self.device)
+				self._ctx_count = 0
+				if cfg.context_encoder == 'pearl':
+					self._z_ctx_mu = torch.zeros(1, cfg.task_dim, device=self.device)
+					self._z_ctx_logvar = torch.zeros(1, cfg.task_dim, device=self.device)
+				else:  # supervised
+					self._z_ctx = torch.zeros(1, cfg.task_dim, device=self.device)
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
 			self._update = torch.compile(self._update, mode="reduce-overhead")
@@ -172,16 +181,25 @@ class TDMPC2(torch.nn.Module):
 		return state_dict.get("step", 0)
 
 	def _reset_context(self):
-		"""Reset the online context, returning the posterior to the N(0, I) prior."""
-		self._ctx_count = 0
-		self._z_ctx_mu.zero_()
-		self._z_ctx_logvar.zero_()
+		"""Reset the online context to its episode-start prior."""
+		if self.cfg.context_encoder == 'varibad':
+			self._ctx_h.zero_()
+			self._belief.zero_()
+		else:
+			self._ctx_count = 0
+			if self.cfg.context_encoder == 'pearl':
+				self._z_ctx_mu.zero_()
+				self._z_ctx_logvar.zero_()
+			else:  # supervised
+				self._z_ctx.zero_()
 
 	@torch.no_grad()
 	def update_context(self, obs, action, reward, next_obs):
 		"""
-		Append a transition to the online context and recompute the
-		posterior q(z|c) over the task latent. Call after each env step.
+		Feed a transition into the online context and recompute the task latent.
+		Call after each env step. For the recurrent VariBAD encoder this is a
+		one-step belief update; for pearl / supervised the transition is appended
+		to a rolling buffer and the latent is re-inferred from the window.
 
 		Args:
 			obs (torch.Tensor): Observation before the step (padded dims).
@@ -195,13 +213,22 @@ class TDMPC2(torch.nn.Module):
 			torch.as_tensor(reward, dtype=torch.float32, device=self.device).view(1),
 			next_obs.to(self.device, non_blocking=True).view(-1),
 		])
+		if self.cfg.context_encoder == 'varibad':
+			belief, h = self.model.belief_update(tup.unsqueeze(0), self._ctx_h)
+			self._ctx_h.copy_(h)
+			self._belief.copy_(belief)
+			return
 		self._ctx_buf[self._ctx_count % self.cfg.context_window] = tup
 		self._ctx_count += 1
 		n = min(self._ctx_count, self.cfg.context_window)
 		mask = (torch.arange(self.cfg.context_window, device=self.device) < n).float()
-		mu, logvar = self.model.infer_ctx(self._ctx_buf, mask)
-		self._z_ctx_mu.copy_(mu.unsqueeze(0))
-		self._z_ctx_logvar.copy_(logvar.unsqueeze(0))
+		if self.cfg.context_encoder == 'pearl':
+			mu, logvar = self.model.infer_ctx(self._ctx_buf, mask)
+			self._z_ctx_mu.copy_(mu.unsqueeze(0))
+			self._z_ctx_logvar.copy_(logvar.unsqueeze(0))
+		else:  # supervised
+			z = self.model.infer_ctx(self._ctx_buf, mask)
+			self._z_ctx.copy_(z.unsqueeze(0))
 
 	@torch.no_grad()
 	def act(self, obs, t0=False, eval_mode=False, task=None):
@@ -226,7 +253,11 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.multitask:
 			if t0:
 				self._reset_context()
-			if eval_mode:
+			if self.cfg.context_encoder == 'varibad':
+				z_ctx = self._belief
+			elif self.cfg.context_encoder == 'supervised':
+				z_ctx = self._z_ctx
+			elif eval_mode:
 				z_ctx = self._z_ctx_mu
 			else:
 				z_ctx = self._z_ctx_mu + torch.randn_like(self._z_ctx_mu) * torch.exp(0.5*self._z_ctx_logvar)
@@ -380,13 +411,23 @@ class TDMPC2(torch.nn.Module):
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		return reward + discount * (1-terminated) * self.model.Q(next_z, action, z_ctx, return_type='min', target=True)
 
-	def _update(self, obs, action, reward, terminated, task=None, ctx=None):
-		# Infer task latent from context (PEARL-style)
-		if self.cfg.multitask:
+	def _update(self, obs, action, reward, terminated, task=None, ctx=None, ctx2=None):
+		# Infer the task latent from context, per encoder.
+		ctx_mu = ctx_logvar = beliefs = None
+		if not self.cfg.multitask:
+			z_ctx = None
+		elif self.cfg.context_encoder == 'pearl':
 			ctx_mu, ctx_logvar = self.model.infer_ctx(ctx)
 			z_ctx = ctx_mu + torch.randn_like(ctx_mu) * torch.exp(0.5*ctx_logvar)
-		else:
-			z_ctx = None
+		elif self.cfg.context_encoder == 'varibad':
+			# Condition on the belief after a random number of context steps
+			# (including 0 = prior), exposing the model to the full spectrum of
+			# belief widths encountered online (Bayes-adaptive training).
+			beliefs = self.model.belief_rollout(ctx)
+			t_idx = torch.randint(0, beliefs.shape[1], (beliefs.shape[0],), device=beliefs.device)
+			z_ctx = beliefs.gather(1, t_idx.view(-1, 1, 1).expand(-1, 1, beliefs.shape[-1])).squeeze(1)
+		else:  # supervised
+			z_ctx = self.model.infer_ctx(ctx)
 
 		# Compute targets
 		with torch.no_grad():
@@ -427,16 +468,34 @@ class TDMPC2(torch.nn.Module):
 		else:
 			termination_loss = 0.
 		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
-		if self.cfg.multitask:
+		# Context regulariser, per encoder: KL for the probabilistic encoders
+		# (pearl: KL to the N(0,I) prior; varibad: sequential KL belief_t || belief_{t-1})
+		# or a supervised loss (task classification / supervised InfoNCE).
+		kl_loss, context_loss, context_acc = 0., 0., 0.
+		if self.cfg.multitask and self.cfg.context_encoder == 'pearl':
 			kl_loss = math.gaussian_kl(ctx_mu, ctx_logvar).mean()
+			ctx_reg = self.cfg.kl_coef * kl_loss
+		elif self.cfg.multitask and self.cfg.context_encoder == 'varibad':
+			mus, logvars = beliefs.chunk(2, dim=-1)
+			kl_loss = math.gaussian_kl_pair(
+				mus[:, 1:], logvars[:, 1:], mus[:, :-1], logvars[:, :-1]).mean()
+			ctx_reg = self.cfg.kl_coef * kl_loss
+		elif self.cfg.multitask:  # supervised
+			if self.cfg.context_loss == 'nce':
+				context_loss = math.info_nce(z_ctx, self.model.infer_ctx(ctx2), task, self.cfg.nce_temp)
+			else:
+				task_logits = self.model.classify_ctx(z_ctx)
+				context_loss = F.cross_entropy(task_logits, task)
+				context_acc = (task_logits.argmax(-1) == task).float().mean()
+			ctx_reg = self.cfg.context_coef * context_loss
 		else:
-			kl_loss = 0.
+			ctx_reg = 0.
 		total_loss = (
 			self.cfg.consistency_coef * consistency_loss +
 			self.cfg.reward_coef * reward_loss +
 			self.cfg.termination_coef * termination_loss +
 			self.cfg.value_coef * value_loss +
-			self.cfg.kl_coef * kl_loss
+			ctx_reg
 		)
 
 		# Update model
@@ -459,19 +518,26 @@ class TDMPC2(torch.nn.Module):
 			"value_loss": value_loss,
 			"termination_loss": termination_loss,
 			"kl_loss": kl_loss,
+			"context_loss": context_loss,
+			"context_acc": context_acc,
 			"total_loss": total_loss,
 			"grad_norm": grad_norm,
 		})
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]))
-		if self.cfg.multitask:
-			# Context-posterior diagnostics: average posterior std (-> 0 as the
-			# context becomes identifiable, -> 1 as it falls back to the prior)
-			# and the typical magnitude of the inferred context mean.
+		if self.cfg.multitask and self.cfg.context_encoder in ('pearl', 'varibad'):
+			# Posterior diagnostics: average posterior std (-> 0 as the context
+			# becomes identifiable, -> 1 as it falls back to the prior) and the
+			# typical magnitude of the inferred context mean. For varibad z_ctx is
+			# the belief [mu, logvar]; for pearl use the inferred (mu, logvar).
+			if self.cfg.context_encoder == 'varibad':
+				ctx_mu, ctx_logvar = z_ctx.chunk(2, dim=-1)
 			info.update(TensorDict({
 				"ctx_post_std": torch.exp(0.5*ctx_logvar).mean(),
 				"ctx_mu_norm": ctx_mu.norm(dim=-1).mean(),
 			}))
+		elif self.cfg.multitask:  # supervised
+			info.update(TensorDict({"ctx_emb_norm": z_ctx.norm(dim=-1).mean()}))
 		info.update(pi_info)
 		return info.detach().mean()
 
@@ -490,6 +556,9 @@ class TDMPC2(torch.nn.Module):
 		if task is not None:
 			kwargs["task"] = task
 			kwargs["ctx"] = ctx
+			if self.cfg.context_encoder == 'supervised' and self.cfg.context_loss == 'nce':
+				# Independent second window per task for contrastive positives.
+				kwargs["ctx2"] = buffer.sample_context(task)
 		torch.compiler.cudagraph_mark_step_begin()
 		return self._update(obs, action, reward, terminated, **kwargs)
 
@@ -497,12 +566,23 @@ class TDMPC2(torch.nn.Module):
 		"""
 		Scalar world-model loss for a (sub-)batch, used only as a diagnostic by
 		`grad_conflict`. Mirrors the world-model terms of `_update` (consistency,
-		reward, value, context KL) but performs no optimiser or policy update and
-		runs eagerly (it is never compiled). The termination term is omitted; it
-		is inactive for the non-episodic multitask suites this is used on.
+		reward, value) plus the encoder's per-task context regulariser, runs
+		eagerly (never compiled), and performs no optimiser or policy update.
+		The termination term is omitted (inactive for the non-episodic multitask
+		suites used here); for the supervised encoder the InfoNCE loss is omitted
+		because it couples tasks within a batch (only the CE term is per-task).
 		"""
-		ctx_mu, ctx_logvar = self.model.infer_ctx(ctx)
-		z_ctx = ctx_mu + torch.randn_like(ctx_mu) * torch.exp(0.5*ctx_logvar)
+		# Context inference, per encoder.
+		ctx_mu = ctx_logvar = beliefs = None
+		if self.cfg.context_encoder == 'pearl':
+			ctx_mu, ctx_logvar = self.model.infer_ctx(ctx)
+			z_ctx = ctx_mu + torch.randn_like(ctx_mu) * torch.exp(0.5*ctx_logvar)
+		elif self.cfg.context_encoder == 'varibad':
+			beliefs = self.model.belief_rollout(ctx)
+			t_idx = torch.randint(0, beliefs.shape[1], (beliefs.shape[0],), device=beliefs.device)
+			z_ctx = beliefs.gather(1, t_idx.view(-1, 1, 1).expand(-1, 1, beliefs.shape[-1])).squeeze(1)
+		else:  # supervised
+			z_ctx = self.model.infer_ctx(ctx)
 		with torch.no_grad():
 			next_z = self.model.encode(obs[1:], z_ctx)
 			td_targets = self._td_target(next_z, reward, terminated, task, z_ctx)
@@ -524,13 +604,21 @@ class TDMPC2(torch.nn.Module):
 		consistency_loss = consistency_loss / self.cfg.horizon
 		reward_loss = reward_loss / self.cfg.horizon
 		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
-		kl_loss = math.gaussian_kl(ctx_mu, ctx_logvar).mean()
-		return (
+		loss = (
 			self.cfg.consistency_coef * consistency_loss +
 			self.cfg.reward_coef * reward_loss +
-			self.cfg.value_coef * value_loss +
-			self.cfg.kl_coef * kl_loss
+			self.cfg.value_coef * value_loss
 		)
+		# Per-task context regulariser (NCE omitted: it couples tasks).
+		if self.cfg.context_encoder == 'pearl':
+			loss = loss + self.cfg.kl_coef * math.gaussian_kl(ctx_mu, ctx_logvar).mean()
+		elif self.cfg.context_encoder == 'varibad':
+			mus, logvars = beliefs.chunk(2, dim=-1)
+			loss = loss + self.cfg.kl_coef * math.gaussian_kl_pair(
+				mus[:, 1:], logvars[:, 1:], mus[:, :-1], logvars[:, :-1]).mean()
+		elif self.cfg.context_loss != 'nce':  # supervised, ce
+			loss = loss + self.cfg.context_coef * F.cross_entropy(self.model.classify_ctx(z_ctx), task)
+		return loss
 
 	@staticmethod
 	def _pair_cos(G):

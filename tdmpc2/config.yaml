@@ -41,10 +41,14 @@ min_std: 0.05
 max_std: 2
 temperature: 0.5
 
-# context (PEARL)
+# context
+context_encoder: pearl   # pearl | varibad | supervised
 num_context: 64
-context_window: 100
-kl_coef: 0.1
+context_window: 100      # online buffer length (pearl, supervised)
+kl_coef: 0.1             # context-posterior KL weight (pearl, varibad)
+context_loss: ce         # supervised only: ce (task classification) | nce (supervised InfoNCE)
+context_coef: 1.0        # supervised only: weight of the context loss
+nce_temp: 0.1            # supervised only: InfoNCE temperature
 
 # diagnostics / logging
 log_grad_conflict: true   # measure per-task gradient conflict at each eval (multitask only)

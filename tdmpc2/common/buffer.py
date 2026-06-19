@@ -165,13 +165,18 @@ class Buffer():
 	def sample_context(self, tasks, num_context=None):
 		"""
 		Sample `num_context` (s, a, r, s') context tuples per task in `tasks`,
-		drawn uniformly from the data of that task (uniform episode, then
-		uniform non-first row; identical to uniform over all transitions
-		since episodes have equal length).
+		drawn from the data of that task.
+
+		The layout depends on the context encoder: for the recurrent VariBAD
+		encoder a single temporally ordered within-episode window is drawn (the
+		GRU needs ordered transitions); for the permutation-invariant PEARL and
+		supervised encoders an unordered set is drawn (uniform episode, then
+		uniform non-first row -- identical to uniform over all transitions since
+		episodes have equal length).
 
 		Args:
 			tasks (torch.Tensor): Task IDs of shape (B,).
-			num_context (int): Context transitions per batch element.
+			num_context (int): Context window length / number of tuples.
 
 		Returns:
 			torch.Tensor: Context batch of shape (B, num_context, ctx_dim).
@@ -184,11 +189,22 @@ class Buffer():
 		tasks = tasks.to(device).long()
 		starts = self._ctx_offsets[tasks]
 		counts = self._ctx_offsets[tasks+1] - starts
-		ep_rand = torch.floor(torch.rand(tasks.shape[0], num_context, device=device) * counts.unsqueeze(1)).long()
-		eps = self._ctx_eps[(starts.unsqueeze(1) + ep_rand).view(-1)].long()
-		# Row offset >= 1 so the preceding row (s) is in the same episode
-		j = torch.randint(1, ep_len, (eps.shape[0],), device=device)
-		rows = eps*ep_len + j
+		if self.cfg.context_encoder == 'varibad':
+			# One temporally ordered window per task.
+			assert num_context < ep_len, \
+				f'num_context={num_context} must be below the episode length {ep_len}.'
+			ep_rand = torch.floor(torch.rand(tasks.shape[0], device=device) * counts).long()
+			eps = self._ctx_eps[starts + ep_rand].long()
+			# Window start offset >= 1 so the preceding row (s) is in the same episode.
+			j = torch.randint(1, ep_len - num_context + 1, (tasks.shape[0],), device=device)
+			rows = ((eps*ep_len + j).unsqueeze(1) + torch.arange(num_context, device=device)).view(-1)
+		else:
+			# Unordered set of transitions per task.
+			ep_rand = torch.floor(torch.rand(tasks.shape[0], num_context, device=device) * counts.unsqueeze(1)).long()
+			eps = self._ctx_eps[(starts.unsqueeze(1) + ep_rand).view(-1)].long()
+			# Row offset >= 1 so the preceding row (s) is in the same episode.
+			j = torch.randint(1, ep_len, (eps.shape[0],), device=device)
+			rows = eps*ep_len + j
 		storage = self._buffer._storage
 		td_t = storage[rows]
 		td_p = storage[rows-1]

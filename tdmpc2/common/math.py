@@ -64,6 +64,48 @@ def gaussian_kl(mu, logvar):
 	return 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).sum(-1)
 
 
+def gaussian_kl_pair(mu_q, logvar_q, mu_p, logvar_p):
+	"""
+	KL divergence between two diagonal Gaussians KL(q || p), summed over the
+	last dim. Used for VariBAD's sequential KL, where the prior for the belief
+	at step t is the belief at step t-1.
+	"""
+	return 0.5 * (
+		logvar_p - logvar_q
+		+ (logvar_q - logvar_p).exp()
+		+ (mu_q - mu_p).pow(2) * (-logvar_p).exp()
+		- 1
+	).sum(-1)
+
+
+def info_nce(z, z_pos, labels, temperature=0.1):
+	"""
+	Symmetric supervised InfoNCE loss over a batch of embedding pairs.
+	Positives are (z_i, z_pos_i); the other batch elements serve as
+	negatives, except those sharing the same label, which are masked out
+	(they are false negatives under task supervision, cf. CORRO /
+	supervised contrastive learning).
+
+	Args:
+		z (torch.Tensor): Embeddings of the first context windows, shape (B, d).
+		z_pos (torch.Tensor): Embeddings of independent windows from the
+			same tasks, shape (B, d).
+		labels (torch.Tensor): Task IDs of shape (B,).
+		temperature (float): Softmax temperature.
+
+	Returns:
+		torch.Tensor: Scalar loss.
+	"""
+	z = F.normalize(z, dim=-1)
+	z_pos = F.normalize(z_pos, dim=-1)
+	logits = z @ z_pos.t() / temperature
+	same = labels.unsqueeze(0) == labels.unsqueeze(1)
+	off_diag_same = same & ~torch.eye(len(labels), dtype=torch.bool, device=z.device)
+	logits = logits.masked_fill(off_diag_same, float('-inf'))
+	target = torch.arange(len(labels), device=z.device)
+	return 0.5 * (F.cross_entropy(logits, target) + F.cross_entropy(logits.t(), target))
+
+
 def int_to_one_hot(x, num_classes):
 	"""
 	Converts an integer tensor to a one-hot tensor.
