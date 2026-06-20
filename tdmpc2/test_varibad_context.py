@@ -207,6 +207,97 @@ def test_buffer_context_sampling():
 	print('buffer context sampling (ordered windows): OK')
 
 
+def make_agent_cfg():
+	"""Full config for constructing a TDMPC2 agent (extends make_mt_cfg)."""
+	cfg = make_mt_cfg()
+	extra = dict(
+		mpc=True,
+		compile=False,
+		lr=3e-4,
+		enc_lr_scale=0.3,
+		horizon=3,
+		batch_size=6,
+		rho=0.5,
+		consistency_coef=20.,
+		reward_coef=0.1,
+		value_coef=0.1,
+		termination_coef=1.,
+		kl_coef=0.1,
+		entropy_coef=1e-4,
+		grad_clip_norm=20.,
+		tau=0.01,
+		iterations=6,
+		discount_denom=5,
+		discount_min=0.95,
+		discount_max=0.995,
+		episode_length=20,
+		episode_lengths=[20, 20, 20],
+		num_context=8,
+		grad_conflict_tasks=3,
+		log_grad_conflict=True,
+	)
+	for k, v in extra.items():
+		setattr(cfg, k, v)
+	cfg.bin_size = (cfg.vmax - cfg.vmin) / (cfg.num_bins - 1)
+	return cfg
+
+
+class _StubBuffer:
+	"""
+	Minimal stand-in for common.buffer.Buffer. Returns synthetic batches in
+	exactly the (obs, action, reward, terminated, task, ctx) layout that
+	TDMPC2.update / grad_conflict consume, so the cuDNN train-mode code paths
+	can be exercised without torchrl or a dataset. Task ids repeat so every
+	task has >= 2 samples (required by grad_conflict).
+	"""
+	def __init__(self, cfg, device):
+		self.cfg, self.device = cfg, device
+
+	def sample(self):
+		cfg, dev = self.cfg, self.device
+		B, H = cfg.batch_size, cfg.horizon
+		od, ad = cfg.obs_shape['state'][0], cfg.action_dim
+		ctx_dim = 2*od + ad + 1
+		obs = torch.randn(H+1, B, od, device=dev)
+		action = torch.randn(H, B, ad, device=dev).clamp(-1, 1)
+		reward = torch.randn(H, B, 1, device=dev)
+		terminated = torch.zeros(H, B, 1, device=dev)
+		task = torch.arange(B, device=dev) % len(cfg.tasks)
+		ctx = torch.randn(B, cfg.num_context, ctx_dim, device=dev)
+		return obs, action, reward, terminated, task, ctx
+
+
+def test_update_and_grad_conflict_cuda():
+	"""
+	GPU regression for the cuDNN RNN train-mode fixes. The VariBAD belief
+	rollout uses a cuDNN GRU whose backward can only run if its forward ran in
+	training mode. Before the fix, both agent.update (belief rollout under the
+	model's default eval mode) and agent.grad_conflict (backward through the
+	GRU during eval) raised "cudnn RNN backward can only be called in training
+	mode". This exercises both paths end-to-end. Requires CUDA (the agent is
+	hard-wired to cuda:0).
+	"""
+	if not torch.cuda.is_available():
+		print('update/grad_conflict cuDNN regression: SKIPPED (no CUDA)')
+		return
+	from tdmpc2 import TDMPC2
+	device = torch.device('cuda:0')
+	agent = TDMPC2(make_agent_cfg())
+	buffer = _StubBuffer(agent.cfg, device)
+
+	# A few updates: raised in _update (belief rollout) before the fix.
+	for _ in range(3):
+		agent.update(buffer)
+	assert not agent.model.training, 'model should be left in eval mode after update'
+
+	# Gradient-conflict diagnostic: raised in grad_conflict before the fix.
+	out = agent.grad_conflict(buffer)
+	assert 'grad_conflict_frac' in out and 'grad_cos_mean/ctx' in out, \
+		f'unexpected grad_conflict output keys: {sorted(out)}'
+	assert not agent.model.training, 'grad_conflict must restore eval mode'
+	print('update/grad_conflict cuDNN regression: OK')
+
+
 if __name__ == '__main__':
 	torch.manual_seed(0)
 	test_gaussian_kl_pair()
@@ -215,4 +306,5 @@ if __name__ == '__main__':
 	test_world_model_multitask()
 	test_world_model_singletask()
 	test_buffer_context_sampling()
+	test_update_and_grad_conflict_cuda()
 	print('\nAll VariBAD context checks passed.')
