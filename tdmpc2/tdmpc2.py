@@ -373,6 +373,11 @@ class TDMPC2(torch.nn.Module):
 		return reward + discount * (1-terminated) * self.model.Q(next_z, action, z_ctx, return_type='min', target=True)
 
 	def _update(self, obs, action, reward, terminated, task=None, ctx=None):
+		# Switch to train mode before any forward pass that participates in the
+		# backward graph. The belief rollout uses a cuDNN RNN, whose backward
+		# can only be called if its forward ran in training mode.
+		self.model.train()
+
 		# Infer beliefs over the latent task variable (VariBAD-style)
 		if self.cfg.multitask:
 			beliefs = self.model.belief_rollout(ctx)
@@ -389,9 +394,6 @@ class TDMPC2(torch.nn.Module):
 		with torch.no_grad():
 			next_z = self.model.encode(obs[1:], z_ctx)
 			td_targets = self._td_target(next_z, reward, terminated, task, z_ctx)
-
-		# Prepare for update
-		self.model.train()
 
 		# Latent rollout
 		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)
