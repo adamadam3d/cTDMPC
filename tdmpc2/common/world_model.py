@@ -148,7 +148,6 @@ class WorldModel(nn.Module):
 		"""
 		Predicts termination signal.
 		"""
-		assert z_ctx is None
 		if self.cfg.multitask:
 			z = self.concat_ctx(z, z_ctx)
 		if unnormalized:
