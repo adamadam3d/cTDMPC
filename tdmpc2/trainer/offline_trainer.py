@@ -109,8 +109,11 @@ class OfflineTrainer(Trainer):
 					if self.cfg.get('log_grad_conflict', True):
 						metrics.update(self.agent.grad_conflict(self.buffer))
 					self.logger.pprint_multitask(metrics, self.cfg)
-					if i > 0:
-						self.logger.save_agent(self.agent, identifier=f'{i}', step=i)
 				self.logger.log(metrics, 'pretrain')
-			
+
+			# Save checkpoints on their own cadence, decoupled from eval_freq so
+			# eval can be made sparse without losing intermediate checkpoints.
+			if i > 0 and i % self.cfg.get('save_freq', self.cfg.eval_freq) == 0:
+				self.logger.save_agent(self.agent, identifier=f'{i}', step=i)
+
 		self.logger.finish(self.agent, step=self.cfg.steps)
