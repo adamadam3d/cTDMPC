@@ -592,15 +592,25 @@ class TDMPC2(torch.nn.Module):
 			return {}
 		random.shuffle(groups)
 		groups = groups[:max_tasks]
-		grads = []
-		for idx in groups:
-			loss = self._model_loss(
-				obs[:, idx], action[:, idx], reward[:, idx], terminated[:, idx],
-				task[idx], ctx[idx])
-			g = torch.autograd.grad(loss, params, allow_unused=True)
-			grads.append(torch.cat([
-				(gi if gi is not None else torch.zeros_like(p)).reshape(-1)
-				for gi, p in zip(g, params)]))
+		# The recurrent (VariBAD) context encoder uses a cuDNN GRU whose backward
+		# can only be called if its forward ran in training mode. grad_conflict is
+		# invoked during eval, so switch to train mode for the gradient computation
+		# (this also matches how _update computes the world-model gradient) and
+		# restore the previous mode afterwards.
+		was_training = self.model.training
+		self.model.train()
+		try:
+			grads = []
+			for idx in groups:
+				loss = self._model_loss(
+					obs[:, idx], action[:, idx], reward[:, idx], terminated[:, idx],
+					task[idx], ctx[idx])
+				g = torch.autograd.grad(loss, params, allow_unused=True)
+				grads.append(torch.cat([
+					(gi if gi is not None else torch.zeros_like(p)).reshape(-1)
+					for gi, p in zip(g, params)]))
+		finally:
+			self.model.train(was_training)
 		G = torch.stack(grads, 0)
 		pair_cos = self._pair_cos(G)
 		out = {
