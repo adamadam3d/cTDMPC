@@ -412,6 +412,11 @@ class TDMPC2(torch.nn.Module):
 		return reward + discount * (1-terminated) * self.model.Q(next_z, action, z_ctx, return_type='min', target=True)
 
 	def _update(self, obs, action, reward, terminated, task=None, ctx=None, ctx2=None):
+		# Switch to train mode before any forward pass that participates in the
+		# backward graph. The varibad belief rollout uses a cuDNN RNN, whose
+		# backward can only be called if its forward ran in training mode.
+		self.model.train()
+
 		# Infer the task latent from context, per encoder.
 		ctx_mu = ctx_logvar = beliefs = None
 		if not self.cfg.multitask:
@@ -433,9 +438,6 @@ class TDMPC2(torch.nn.Module):
 		with torch.no_grad():
 			next_z = self.model.encode(obs[1:], z_ctx)
 			td_targets = self._td_target(next_z, reward, terminated, task, z_ctx)
-
-		# Prepare for update
-		self.model.train()
 
 		# Latent rollout
 		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)
@@ -675,15 +677,25 @@ class TDMPC2(torch.nn.Module):
 			return {}
 		random.shuffle(groups)
 		groups = groups[:max_tasks]
-		grads = []
-		for idx in groups:
-			loss = self._model_loss(
-				obs[:, idx], action[:, idx], reward[:, idx], terminated[:, idx],
-				task[idx], ctx[idx])
-			g = torch.autograd.grad(loss, params, allow_unused=True)
-			grads.append(torch.cat([
-				(gi if gi is not None else torch.zeros_like(p)).reshape(-1)
-				for gi, p in zip(g, params)]))
+		# The recurrent (VariBAD) context encoder uses a cuDNN GRU whose backward
+		# can only be called if its forward ran in training mode. grad_conflict is
+		# invoked during eval, so switch to train mode for the gradient computation
+		# (this also matches how _update computes the world-model gradient) and
+		# restore the previous mode afterwards.
+		was_training = self.model.training
+		self.model.train()
+		try:
+			grads = []
+			for idx in groups:
+				loss = self._model_loss(
+					obs[:, idx], action[:, idx], reward[:, idx], terminated[:, idx],
+					task[idx], ctx[idx])
+				g = torch.autograd.grad(loss, params, allow_unused=True)
+				grads.append(torch.cat([
+					(gi if gi is not None else torch.zeros_like(p)).reshape(-1)
+					for gi, p in zip(g, params)]))
+		finally:
+			self.model.train(was_training)
 		G = torch.stack(grads, 0)
 		# Overall conflict over the full world-model gradient.
 		pair_cos = self._pair_cos(G)
