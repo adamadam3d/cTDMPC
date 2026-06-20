@@ -59,7 +59,14 @@ class TDMPC2(torch.nn.Module):
 					self._z_ctx = torch.zeros(1, cfg.task_dim, device=self.device)
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
-			self._update = torch.compile(self._update, mode="reduce-overhead")
+			# The VariBAD encoder's cuDNN GRU keeps a backward reserve-space
+			# tensor alive across graph breaks that CUDA graph trees cannot
+			# account for ("live storage data ptrs in the cudagraph pool but not
+			# accounted for as an output"). Fall back to the default inductor
+			# mode (compiled, no cudagraphs) for it; cudagraphs are safe for the
+			# non-recurrent encoders.
+			update_mode = "default" if (cfg.multitask and cfg.context_encoder == "varibad") else "reduce-overhead"
+			self._update = torch.compile(self._update, mode=update_mode)
 
 	@property
 	def plan(self):
