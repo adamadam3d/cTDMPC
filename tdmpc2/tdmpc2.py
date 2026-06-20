@@ -48,7 +48,13 @@ class TDMPC2(torch.nn.Module):
 			self._belief = torch.zeros(1, cfg.task_dim, device=self.device)
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
-			self._update = torch.compile(self._update, mode="reduce-overhead")
+			# The cuDNN GRU context encoder keeps a backward reserve-space tensor
+			# alive across graph breaks that CUDA graph trees cannot account for
+			# ("live storage data ptrs in the cudagraph pool but not accounted
+			# for as an output"). Use the default inductor mode (compiled, no
+			# cudagraphs) in multitask (GRU) runs; cudagraphs are safe otherwise.
+			update_mode = "default" if cfg.multitask else "reduce-overhead"
+			self._update = torch.compile(self._update, mode=update_mode)
 
 	@property
 	def plan(self):
