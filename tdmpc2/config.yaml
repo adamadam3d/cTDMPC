@@ -9,7 +9,8 @@ episodic: false
 # evaluation
 checkpoint: ???
 eval_episodes: 10
-eval_freq: 50000
+eval_freq: 150000
+save_freq: 50000
 
 # training
 steps: 10_000_000
