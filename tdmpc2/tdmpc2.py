@@ -44,7 +44,9 @@ class TDMPC2(torch.nn.Module):
 		if cfg.multitask:
 			# Online context state for inference during rollouts, per encoder.
 			ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
-			if cfg.context_encoder == 'varibad':
+			if cfg.context_encoder == 'task_id':
+				pass  # conditioning is the task id itself; no online state needed
+			elif cfg.context_encoder == 'varibad':
 				# Recurrent belief: GRU hidden state carried across the episode.
 				self._ctx_h = torch.zeros(1, 1, cfg.enc_dim, device=self.device)
 				self._belief = torch.zeros(1, cfg.task_dim, device=self.device)
@@ -189,6 +191,8 @@ class TDMPC2(torch.nn.Module):
 
 	def _reset_context(self):
 		"""Reset the online context to its episode-start prior."""
+		if self.cfg.context_encoder == 'task_id':
+			return  # nothing to reset; z_ctx is the task embedding
 		if self.cfg.context_encoder == 'varibad':
 			self._ctx_h.zero_()
 			self._belief.zero_()
@@ -214,6 +218,8 @@ class TDMPC2(torch.nn.Module):
 			reward (float): Reward received.
 			next_obs (torch.Tensor): Observation after the step (padded dims).
 		"""
+		if self.cfg.context_encoder == 'task_id':
+			return  # conditioning is the task id; nothing to update online
 		tup = torch.cat([
 			obs.to(self.device, non_blocking=True).view(-1),
 			action.to(self.device, non_blocking=True).view(-1),
@@ -260,7 +266,9 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.multitask:
 			if t0:
 				self._reset_context()
-			if self.cfg.context_encoder == 'varibad':
+			if self.cfg.context_encoder == 'task_id':
+				z_ctx = self.model.task_latent(task)
+			elif self.cfg.context_encoder == 'varibad':
 				z_ctx = self._belief
 			elif self.cfg.context_encoder == 'supervised':
 				z_ctx = self._z_ctx
@@ -428,6 +436,8 @@ class TDMPC2(torch.nn.Module):
 		ctx_mu = ctx_logvar = beliefs = None
 		if not self.cfg.multitask:
 			z_ctx = None
+		elif self.cfg.context_encoder == 'task_id':
+			z_ctx = self.model.task_latent(task)
 		elif self.cfg.context_encoder == 'pearl':
 			ctx_mu, ctx_logvar = self.model.infer_ctx(ctx)
 			z_ctx = ctx_mu + torch.randn_like(ctx_mu) * torch.exp(0.5*ctx_logvar)
@@ -489,7 +499,7 @@ class TDMPC2(torch.nn.Module):
 			kl_loss = math.gaussian_kl_pair(
 				mus[:, 1:], logvars[:, 1:], mus[:, :-1], logvars[:, :-1]).mean()
 			ctx_reg = self.cfg.kl_coef * kl_loss
-		elif self.cfg.multitask:  # supervised
+		elif self.cfg.multitask and self.cfg.context_encoder == 'supervised':
 			if self.cfg.context_loss == 'nce':
 				context_loss = math.info_nce(z_ctx, self.model.infer_ctx(ctx2), task, self.cfg.nce_temp)
 			else:
@@ -497,7 +507,7 @@ class TDMPC2(torch.nn.Module):
 				context_loss = F.cross_entropy(task_logits, task)
 				context_acc = (task_logits.argmax(-1) == task).float().mean()
 			ctx_reg = self.cfg.context_coef * context_loss
-		else:
+		else:  # single-task, or task_id (oracle embedding: no context regulariser)
 			ctx_reg = 0.
 		total_loss = (
 			self.cfg.consistency_coef * consistency_loss +
@@ -583,7 +593,9 @@ class TDMPC2(torch.nn.Module):
 		"""
 		# Context inference, per encoder.
 		ctx_mu = ctx_logvar = beliefs = None
-		if self.cfg.context_encoder == 'pearl':
+		if self.cfg.context_encoder == 'task_id':
+			z_ctx = self.model.task_latent(task)
+		elif self.cfg.context_encoder == 'pearl':
 			ctx_mu, ctx_logvar = self.model.infer_ctx(ctx)
 			z_ctx = ctx_mu + torch.randn_like(ctx_mu) * torch.exp(0.5*ctx_logvar)
 		elif self.cfg.context_encoder == 'varibad':
@@ -625,7 +637,7 @@ class TDMPC2(torch.nn.Module):
 			mus, logvars = beliefs.chunk(2, dim=-1)
 			loss = loss + self.cfg.kl_coef * math.gaussian_kl_pair(
 				mus[:, 1:], logvars[:, 1:], mus[:, :-1], logvars[:, :-1]).mean()
-		elif self.cfg.context_loss != 'nce':  # supervised, ce
+		elif self.cfg.context_encoder == 'supervised' and self.cfg.context_loss != 'nce':  # ce
 			loss = loss + self.cfg.context_coef * F.cross_entropy(self.model.classify_ctx(z_ctx), task)
 		return loss
 

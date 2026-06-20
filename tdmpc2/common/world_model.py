@@ -25,6 +25,9 @@ class WorldModel(nn.Module):
 			#                 belief b_t = [mu_t, logvar_t] at every step.
 			#   supervised -- an MLP embeds each tuple, embeddings are mean-pooled
 			#                 into a deterministic latent z trained on task labels.
+			#   task_id    -- original TD-MPC2 oracle conditioning: a learned
+			#                 per-task embedding looked up by task id (no inference
+			#                 from context).
 			ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
 			if cfg.context_encoder == 'pearl':
 				self._ctx_enc = layers.mlp(ctx_dim, 2*[cfg.enc_dim], 2*cfg.task_dim)
@@ -40,6 +43,8 @@ class WorldModel(nn.Module):
 					'enc': layers.mlp(ctx_dim, 2*[cfg.enc_dim], cfg.task_dim),
 					'clf': nn.Linear(cfg.task_dim, len(cfg.tasks)),
 				})
+			elif cfg.context_encoder == 'task_id':
+				self._ctx_enc = nn.Embedding(len(cfg.tasks), cfg.task_dim, max_norm=1)
 			else:
 				raise ValueError(f'Unknown context_encoder: {cfg.context_encoder}')
 			self.register_buffer("_action_masks", torch.zeros(len(cfg.tasks), cfg.action_dim))
@@ -139,6 +144,10 @@ class WorldModel(nn.Module):
 	def classify_ctx(self, z):
 		"""Predict task logits from the task latent (supervised encoder)."""
 		return self._ctx_enc['clf'](z)
+
+	def task_latent(self, task):
+		"""Look up the learned per-task embedding (task_id / original TD-MPC2)."""
+		return self._ctx_enc(task)
 
 	def _belief(self, hidden):
 		"""Project GRU hidden states to belief vectors [mu, logvar] (VariBAD)."""

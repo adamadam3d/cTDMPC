@@ -43,7 +43,7 @@ max_std: 2
 temperature: 0.5
 
 # context
-context_encoder: pearl   # pearl | varibad | supervised
+context_encoder: pearl   # pearl | varibad | supervised | task_id (original TD-MPC2 oracle embedding)
 num_context: 64
 context_window: 100      # online buffer length (pearl, supervised)
 kl_coef: 0.1             # context-posterior KL weight (pearl, varibad)
