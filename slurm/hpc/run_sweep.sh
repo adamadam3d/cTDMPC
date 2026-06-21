@@ -12,18 +12,20 @@
 #SBATCH -D /mnt/beegfs/data/AI-REEFSHIELD/tdm/cTDMPC/tdmpc2/
 #SBATCH --array=0-7
 
-# 4 context encoders x 2 seeds (3, 4) = 8 array tasks.
-# Index layout: task = SLURM_ARRAY_TASK_ID
-#   encoder = ENCODERS[task / 2]
-#   seed    = SEEDS[task % 2]
-ENCODERS=(pearl varibad supervised task_id)
-# WandB project per encoder, mirroring the original convention (task_id -> taskID)
-PROJECTS=(pearl varibad supervised taskID)
-SEEDS=(3 4)
+# Explicit (encoder, seed) per array task. Encoder-first within the main grid so
+# the first wave covers all encoders @ seed 3, then seed 4, then the extra
+# pearl-only seeds (2 and 5).
+#   task: 0        1        2      3        4        5      6      7
+ENC_LIST=( varibad  task_id  pearl  varibad  task_id  pearl  pearl  pearl )
+SEED_LIST=(3        3        3      4        4        4      2      5     )
 
-ENC=${ENCODERS[$((SLURM_ARRAY_TASK_ID / 2))]}
-PROJ=${PROJECTS[$((SLURM_ARRAY_TASK_ID / 2))]}
-SEED=${SEEDS[$((SLURM_ARRAY_TASK_ID % 2))]}
+ENC=${ENC_LIST[$SLURM_ARRAY_TASK_ID]}
+SEED=${SEED_LIST[$SLURM_ARRAY_TASK_ID]}
+# WandB project mirrors the encoder (task_id -> taskID convention).
+case $ENC in
+    task_id) PROJ=taskID ;;
+    *)       PROJ=$ENC ;;
+esac
 
 echo "Array task $SLURM_ARRAY_TASK_ID -> context_encoder=$ENC seed=$SEED project=$PROJ"
 
@@ -52,7 +54,8 @@ singularity exec \
         steps=3000000 \
         compile=true \
         wandb_project=sweep_param5 \
-        eval_episodes=5 \
+        eval_episodes=10 \
+        eval_freq=500000 \
         exp_name=seed${SEED}_${ENC}_param5 \
         wandb_entity=https-www-guc-edu-eg- \
         seed=$SEED \
