@@ -18,7 +18,7 @@
 # not support sm_61. If this job dies with a CUDA "no kernel image" / Triton
 # compile error, re-run with compile=false (slower, but works on Pascal).
 ENC=task_id
-PROJ=taskID
+PROJ=sweep_param5
 SEEDS=(5 6 7)
 SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
