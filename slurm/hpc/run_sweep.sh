@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=tdmpc2-reefshield
-#SBATCH --partition=gpu_volta,gpu_ampere
+#SBATCH --partition=gpu_ampere,gpu_volta
 #SBATCH --account=deepl
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=adam.elsayed@dfki.de
