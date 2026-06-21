@@ -6,7 +6,7 @@
 #SBATCH --mail-user=adam.elsayed@dfki.de
 #SBATCH --time=3-00:00:00
 #SBATCH -N 1
-#SBATCH --mem=49G
+#SBATCH --mem=48G
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH -D /mnt/beegfs/data/AI-REEFSHIELD/tdm/cTDMPC/tdmpc2/
@@ -51,8 +51,9 @@ singularity exec \
         batch_size=256 \
         steps=3000000 \
         compile=true \
-        wandb_project=$PROJ \
-        exp_name=seed${SEED}_${ENC}_mt30_param5 \
+        wandb_project=sweep_param5 \
+        eval_episodes=5 \
+        exp_name=seed${SEED}_${ENC}_param5 \
         wandb_entity=https-www-guc-edu-eg- \
         seed=$SEED \
         data_dir=/mnt/beegfs/data/AI-REEFSHIELD/tdm/mt30/mt30 \

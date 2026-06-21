@@ -141,6 +141,7 @@ class TDMPC2(torch.nn.Module):
 				"model_size": self.cfg.get("model_size", None),
 				"episodic": self.cfg.get("episodic", None),
 				"multitask": self.cfg.get("multitask", None),
+				"context_encoder": self.cfg.get("context_encoder", None),
 			},
 		}
 		if hasattr(self, 'optim'):
