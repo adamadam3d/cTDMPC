@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tdmpc2-titan-taskid5
+#SBATCH --job-name=tdmpc2-titan-taskid
 #SBATCH --partition=gpu_titan
 #SBATCH --account=deepl
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -10,14 +10,17 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH -D /mnt/beegfs/data/AI-REEFSHIELD/tdm/cTDMPC/tdmpc2/
+#SBATCH --array=0-2
 
-# Single run: context_encoder=task_id, seed=5, on the Pascal Titan partition.
+# context_encoder=task_id, seeds 5/6/7, on the Pascal Titan partition.
+#   task 0 -> seed 5, task 1 -> seed 6, task 2 -> seed 7
 # NOTE: Pascal (sm_61) + compile=true is the gamble here -- Triton/inductor may
 # not support sm_61. If this job dies with a CUDA "no kernel image" / Triton
 # compile error, re-run with compile=false (slower, but works on Pascal).
 ENC=task_id
 PROJ=taskID
-SEED=5
+SEEDS=(5 6 7)
+SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
 echo "Running context_encoder=$ENC seed=$SEED project=$PROJ on $(hostname)"
 
