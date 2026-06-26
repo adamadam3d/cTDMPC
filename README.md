@@ -10,20 +10,33 @@ Built on the official implementation of [TD-MPC2: Scalable, Robust World Models 
 
 ## What is different from TD-MPC2?
 
-Vanilla multi-task TD-MPC2 conditions every component (encoder, dynamics, reward, policy, Q-functions) on a learned embedding `e` looked up by the ground-truth task ID. This fork removes that lookup entirely:
+Vanilla multi-task TD-MPC2 conditions every component (encoder, dynamics, reward, policy, Q-functions) on a learned embedding `e` looked up by the ground-truth task ID. This fork replaces that lookup with a **context encoder** that infers a task latent `z` from experience. No network sees the task ID — the ID survives only for env-side plumbing (action-space masks and per-task discounts), the standard PEARL assumption that the environment is given while task semantics are hidden. All components are conditioned on `z`, which is detached for the policy update.
 
-- **Context encoder (MLP + Product of Gaussians).** An MLP maps each context transition `(s, a, r, s')` to a Gaussian factor `(mu_i, sigma_i)`. Factors are combined into a posterior `q(z|c)` via a Product of Gaussians, with the `N(0, I)` prior included as a factor so that an empty context cleanly reduces to the prior.
-- **Task inference, not task identity.** No network ever sees the task ID. All components are conditioned on a latent `z` sampled from `q(z|c)`. The ID survives only for env-side plumbing (action-space masks and per-task discounts) — the standard PEARL assumption that the environment is given while task semantics are hidden.
-- **Training (offline, mt30/mt80).** For each batch element, `num_context` transitions of the same task are sampled independently from the offline dataset. The encoder is trained through all world-model losses (consistency, reward, value) plus a `KL(q(z|c) || N(0, I))` regularizer weighted by `kl_coef`. The latent is detached for the policy update.
-- **Inference (incremental in-episode posterior).** At episode start the agent acts under the prior. After every step, the new transition is appended to an online context FIFO (`context_window`) and the posterior is recomputed — the agent figures out which task it is in *while acting*. Evaluation uses the posterior mean.
+The encoder is selectable via `context_encoder` (see `config.yaml`). Every variant consumes context transitions `(s, a, r, s')` of dimension `2*state_dim + action_dim + 1`; they differ in how those transitions are aggregated and what trains the latent.
+
+### Context encoder types
+
+- **`pearl` (default) — Product-of-Gaussians posterior.** An MLP maps each context transition to a Gaussian factor `(mu_i, sigma_i)`. Factors are combined into a posterior `q(z|c)` via a Product of Gaussians (permutation-invariant), with the `N(0, I)` prior included as a factor so that an empty context cleanly reduces to the prior. Trained end-to-end through all world-model losses plus a `KL(q(z|c) || N(0, I))` regularizer weighted by `kl_coef`. At inference, `z` is the posterior mean.
+- **`varibad` — recurrent belief.** A GRU processes the context transitions in temporal order (`embed → gru → head`) and emits a belief `b_t = [mu_t, logvar_t]` at every step, so the latent evolves as the episode unfolds rather than being recomputed from a permutation-invariant set. Also trained through the world-model losses with a `kl_coef`-weighted KL to the prior. Uses the recurrent `belief_rollout` / `belief_update` path instead of the set-based `infer_ctx`, and requires an even `task_dim`.
+- **`supervised` — task-classification / contrastive latent.** An MLP embeds each transition and mean-pools the embeddings into a *deterministic* latent `z`. The latent is shaped by an auxiliary `context_loss` (weighted by `context_coef`): `ce` trains a linear classifier head to predict the task label, while `nce` uses a supervised InfoNCE objective (temperature `nce_temp`) that pulls same-task contexts together. This is the only variant that uses task labels as a direct training signal.
+- **`task_id` — oracle baseline (original TD-MPC2).** A learned per-task embedding looked up directly by task ID. No inference from context — this is the upstream multi-task conditioning, kept as an upper-bound reference against the inference-based encoders.
+
+### Training and inference
+
+- **Training (offline, mt30/mt80).** For each batch element, `num_context` transitions of the same task are sampled from the offline dataset (in temporal order for `varibad`, independently otherwise). The encoder trains jointly with the world model.
+- **Inference (in-episode adaptation).** For the inference-based encoders (`pearl`, `varibad`, `supervised`), the agent starts each episode under the prior and refines its task belief from the transitions it observes while acting — `pearl`/`supervised` keep an online context FIFO of length `context_window`, while `varibad` carries the GRU hidden state forward. `task_id` simply reads its embedding.
 
 New config parameters (see `config.yaml`):
 
-| argument | default | description |
-| --- | --- | --- |
-| `num_context` | 64 | context transitions per batch element during training |
-| `context_window` | 100 | max online context transitions kept during rollout |
-| `kl_coef` | 0.1 | weight of the KL regularizer (PEARL's `kl_lambda`) |
+| argument | default | applies to | description |
+| --- | --- | --- | --- |
+| `context_encoder` | `pearl` | all | which encoder to use: `pearl` \| `varibad` \| `supervised` \| `task_id` |
+| `num_context` | 64 | inference encoders | context transitions per batch element during training |
+| `context_window` | 100 | `pearl`, `supervised` | max online context transitions kept during rollout |
+| `kl_coef` | 0.1 | `pearl`, `varibad` | weight of the KL regularizer (PEARL's `kl_lambda`) |
+| `context_loss` | `ce` | `supervised` | auxiliary objective: `ce` (task classification) \| `nce` (supervised InfoNCE) |
+| `context_coef` | 1.0 | `supervised` | weight of the auxiliary context loss |
+| `nce_temp` | 0.1 | `supervised` | InfoNCE temperature |
 
 Single-task training and evaluation are completely unaffected — all changes are gated behind `multitask=true`.
 
