@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=tdmpc2-resume
-#SBATCH --partition=gpu_ampere,gpu_volta
+#SBATCH --partition=gpu_ampere,gpu_voltage,gpu_titan
 #SBATCH --account=deepl
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=adam.elsayed@dfki.de
