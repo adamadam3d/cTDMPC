@@ -6,7 +6,7 @@
 #SBATCH --mail-user=adam.elsayed@dfki.de
 #SBATCH --time=2-00:00:00
 #SBATCH -N 1
-#SBATCH --mem=64G
+#SBATCH --mem=96G
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:1
 #SBATCH -D /mnt/beegfs/data/AI-REEFSHIELD/tdm/cTDMPC/tdmpc2/
@@ -54,8 +54,17 @@ if [ -z "$WANDB_API_KEY" ]; then
 fi
 export SINGULARITYENV_WANDB_API_KEY=$WANDB_API_KEY
 
+# Four simultaneous torch.compile runs exhaust host RAM (std::bad_alloc in
+# inductor): each process spawns ~one compile worker per core by default.
+# Cap the workers per process; the launch stagger below does the rest.
+export SINGULARITYENV_TORCHINDUCTOR_COMPILE_THREADS=2
+
 for (( p=0; p<PROCS_PER_GPU; p++ )); do
     SHARD=$(( GPU_IDX * PROCS_PER_GPU + p ))
+    # Stagger launches so the compile phases do not overlap: process 0 pays
+    # the compile cost, later processes hit its inductor cache in /tmp
+    # (node-local, shared by all 4 processes) and start almost warm.
+    sleep $(( p == 0 ? 0 : 180 ))
     # Separate hydra run dirs: simultaneous launches would otherwise collide on
     # hydra's timestamped default output directory.
     singularity exec \
