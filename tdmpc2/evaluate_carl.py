@@ -107,6 +107,12 @@ def evaluate_carl(cfg: dict):
     assert torch.cuda.is_available(), "CUDA required for TD-MPC2."
     assert cfg.eval_episodes > 0, 'Must evaluate at least 1 episode.'
     cfg = parse_cfg(cfg)
+    
+    # Use explicitly passed --seed if available, otherwise use cfg.seed
+    eval_seed = os.environ.get('EVAL_SEED')
+    if eval_seed is not None:
+        cfg.seed = int(eval_seed)
+        
     set_seed(cfg.seed)
     
     BIGPICTURE = os.environ.get('BIGPICTURE') == '1' or cfg.get('BIGPICTURE', False) or cfg.get('bigpicture', False)
@@ -249,6 +255,11 @@ def evaluate_carl(cfg: dict):
 
 import sys
 if __name__ == '__main__':
+    if '--seed' in sys.argv:
+        idx = sys.argv.index('--seed')
+        os.environ['EVAL_SEED'] = sys.argv[idx + 1]
+        sys.argv.pop(idx)
+        sys.argv.pop(idx)
     if '-B' in sys.argv:
         os.environ['BIGPICTURE'] = '1'
         sys.argv.remove('-B')
