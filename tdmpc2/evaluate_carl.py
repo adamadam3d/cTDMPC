@@ -205,8 +205,12 @@ def evaluate_carl(cfg: dict):
             print(colored(f'Evaluating {mod_label}', 'cyan'))
             contexts = {0: ctx_dict}
             
-            env = make_carl_env(cfg, domain, task, contexts=contexts)
-            
+            try:
+                env = make_carl_env(cfg, domain, task, contexts=contexts)
+            except ValueError as e:
+                print(colored(f"  Skipping scenario due to physics constraints: {e}", "red"))
+                continue
+                
             ep_rewards, ep_successes = [], []
             for i in range(cfg.eval_episodes):
                 obs, done, ep_reward, t = env.reset(), False, 0, 0
