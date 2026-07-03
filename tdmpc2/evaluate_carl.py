@@ -163,6 +163,10 @@ def evaluate_carl(cfg: dict):
             if not isinstance(default_value, (int, float)):
                 continue
                 
+            # Skip timestep features to avoid breaking dm_control's control/physics timestep integer multiple constraint
+            if 'timestep' in feature_name.lower():
+                continue
+                
             # We vary the default context by evaluating a low (-50%) and high (+50%) value
             modifications = [
                 ("Low", default_value * 0.5), 
