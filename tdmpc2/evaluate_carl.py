@@ -175,8 +175,12 @@ def evaluate_carl(cfg: dict):
         RUN_RANDOM = os.environ.get('RUN_RANDOM') == '1'
         RUN_HIGH = os.environ.get('RUN_HIGH') == '1'
         RUN_LOW = os.environ.get('RUN_LOW') == '1'
-        if not (RUN_RANDOM or RUN_HIGH or RUN_LOW):
-            RUN_RANDOM = RUN_HIGH = RUN_LOW = True
+        RUN_NORMAL = os.environ.get('RUN_NORMAL') == '1'
+        if not (RUN_RANDOM or RUN_HIGH or RUN_LOW or RUN_NORMAL):
+            RUN_RANDOM = RUN_HIGH = RUN_LOW = RUN_NORMAL = True
+            
+        if RUN_NORMAL:
+            eval_scenarios.append(("Baseline / Normal (1.0x)", default_context.copy()))
         
         if BIGPICTURE:
             all_low = default_context.copy()
@@ -285,6 +289,9 @@ if __name__ == '__main__':
     if '-B' in sys.argv:
         os.environ['BIGPICTURE'] = '1'
         sys.argv.remove('-B')
+    if '-n' in sys.argv:
+        os.environ['RUN_NORMAL'] = '1'
+        sys.argv.remove('-n')
     if '-r' in sys.argv:
         os.environ['RUN_RANDOM'] = '1'
         sys.argv.remove('-r')
