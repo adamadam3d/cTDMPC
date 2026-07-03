@@ -22,8 +22,48 @@ CARL_ENV_MAP = {
     'finger': CARLDmcFingerEnv
 }
 
-from envs.dmcontrol import DMControlWrapper, suite
-from dm_control.suite.wrappers import action_scale
+from envs.dmcontrol import suite
+import gymnasium as gym
+import numpy as np
+
+class CARL_TDMPC2_Wrapper(gym.Wrapper):
+    def __init__(self, env, action_repeat=2):
+        super().__init__(env)
+        self.action_repeat = action_repeat
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=self.env.action_space.shape, dtype=np.float32)
+        
+        obs = self.reset()
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=obs.shape, dtype=np.float32)
+        
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        if isinstance(obs, tuple):
+            obs = obs[0]
+        if isinstance(obs, dict):
+            obs = np.concatenate([np.asarray(v).flatten() for v in obs.values()], dtype=np.float32)
+        return np.array(obs, dtype=np.float32)
+
+    def step(self, action):
+        low, high = self.env.action_space.low, self.env.action_space.high
+        scaled_action = low + (action + 1.0) * 0.5 * (high - low)
+        scaled_action = np.clip(scaled_action, low, high)
+        
+        reward = 0.0
+        for _ in range(self.action_repeat):
+            out = self.env.step(scaled_action)
+            if len(out) == 5:
+                obs, r, term, trunc, info = out
+                done = term or trunc
+            else:
+                obs, r, done, info = out
+            reward += r
+            if done:
+                break
+                
+        if isinstance(obs, dict):
+            obs = np.concatenate([np.asarray(v).flatten() for v in obs.values()], dtype=np.float32)
+        return np.array(obs, dtype=np.float32), reward, done, info
+
 from envs.wrappers.timeout import Timeout
 from envs.wrappers.tensor import TensorWrapper
 from envs import make_env as make_original_env
@@ -46,8 +86,7 @@ def make_carl_env(cfg, domain, task, contexts=None):
     )
     
     # Apply standard TD-MPC2 wrappers
-    env = action_scale.Wrapper(env, minimum=-1., maximum=1.)
-    env = DMControlWrapper(env, domain)
+    env = CARL_TDMPC2_Wrapper(env, action_repeat=2)
     env = Timeout(env, max_episode_steps=500)
     env = TensorWrapper(env)
     
