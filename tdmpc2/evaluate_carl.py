@@ -13,7 +13,14 @@ from common.seed import set_seed
 from tdmpc2 import TDMPC2
 
 # CARL imports
-from carl.envs import CARLDmcEnv
+from carl.envs import CARLDMCWalkerEnv, CARLDMCFishEnv, CARLDMCFingerEnv
+
+# Mapping domains to their corresponding CARL environments
+CARL_ENV_MAP = {
+    'walker': CARLDMCWalkerEnv,
+    'fish': CARLDMCFishEnv,
+    'finger': CARLDMCFingerEnv
+}
 
 from envs.dmcontrol import DMControlWrapper, suite
 from dm_control.suite.wrappers import action_scale
@@ -26,8 +33,11 @@ def make_carl_env(cfg, domain, task, contexts=None):
         raise ValueError('Unknown task:', task)
     
     # Initialize CARL DMC environment
-    env = CARLDmcEnv(
-        domain=domain,
+    carl_env_cls = CARL_ENV_MAP.get(domain)
+    if not carl_env_cls:
+        raise ValueError(f'CARL does not support domain: {domain} in this script')
+        
+    env = carl_env_cls(
         task=task,
         contexts=contexts,
         hide_context=True,
@@ -94,7 +104,8 @@ def evaluate_carl(cfg: dict):
         print(colored(f'\n--- Task: {task_str} ---', 'magenta', attrs=['bold']))
         
         # Instantiate once to extract the default contexts available for this domain/task
-        temp_env = CARLDmcEnv(domain=domain, task=task)
+        carl_env_cls = CARL_ENV_MAP[domain]
+        temp_env = carl_env_cls(task=task)
         # Use default context from the CARL environment
         default_context = temp_env.get_default_context()
         
