@@ -94,6 +94,7 @@ save_csv: true
 
 # misc
 compile: true
+cudagraphs: true  # CUDA-graph capture for the compiled planner (reduce-overhead); set false where cudagraph trees misbehave (e.g. evaluate_checkpoints.py)
 save_video: true
 save_agent: true
 seed: 1

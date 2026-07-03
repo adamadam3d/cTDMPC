@@ -86,7 +86,12 @@ class TDMPC2(torch.nn.Module):
 		if _plan_val is not None:
 			return _plan_val
 		if self.cfg.compile:
-			plan = torch.compile(self._plan, mode="reduce-overhead")
+			# cudagraphs=false keeps the inductor-compiled kernels but skips CUDA
+			# graph capture, which fails with std::bad_alloc in the cudagraph pool
+			# check when evaluating checkpoints (same failure class as the VariBAD
+			# update above).
+			plan_mode = "reduce-overhead" if self.cfg.get("cudagraphs", True) else "default"
+			plan = torch.compile(self._plan, mode=plan_mode)
 		else:
 			plan = self._plan
 		self._plan_val = plan

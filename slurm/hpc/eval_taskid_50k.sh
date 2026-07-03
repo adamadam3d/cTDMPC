@@ -92,6 +92,7 @@ for (( p=0; p<PROCS_PER_GPU; p++ )); do
             data_dir=/mnt/beegfs/data/AI-REEFSHIELD/tdm/mt30/mt30 \
             grad_conflict_episodes=20 \
             compile=true \
+            cudagraphs=false \
             save_video=false \
             "exp_name=$EVAL_EXP" \
             wandb_project=eval50k \
