@@ -248,7 +248,13 @@ def evaluate_carl(cfg: dict):
                     action = agent.act(padded_obs, t0=t==0, task=task_idx)
                     prev_obs = padded_obs
                     
-                    env_action = action[:env.action_space.shape[0]] if is_mt else action
+                    env_action = action
+                    if env_action.shape[0] < env.action_space.shape[0]:
+                        padding = torch.zeros(env.action_space.shape[0] - env_action.shape[0], dtype=env_action.dtype, device=env_action.device)
+                        env_action = torch.cat((env_action, padding))
+                    elif env_action.shape[0] > env.action_space.shape[0]:
+                        env_action = env_action[:env.action_space.shape[0]]
+                        
                     obs, reward, done, info = env.step(env_action)
                     
                     # Multi-task context encoders require updating context
