@@ -67,6 +67,31 @@ export SINGULARITYENV_WANDB_API_KEY=$WANDB_API_KEY
 # Cap the workers per process; the launch stagger below does the rest.
 export SINGULARITYENV_TORCHINDUCTOR_COMPILE_THREADS=2
 
+# Optional: CUDA MPS lets the PROCS_PER_GPU processes' kernels run
+# concurrently on the GPU instead of time-slicing it. Only worth it if the
+# GPU is launch-bound (system.gpu.*.gpu ~100% but system.gpu.*.memory in the
+# single digits in wandb's System tab, as observed here) -- MPS cannot help
+# a workload that is already compute-bound. Opt in with:
+#   sbatch --export=ALL,USE_MPS=1 slurm/hpc/eval_taskid_50k.sh
+# The control daemon runs on the host (outside the container); its pipe/log
+# directories are bind-mounted and exported into the container so the client
+# processes inside singularity can find it. One daemon per array task (i.e.
+# per GPU, since --gres=gpu:1), torn down in a trap so it always quits even
+# if the eval loop below fails partway through.
+if [ "${USE_MPS:-0}" = "1" ]; then
+    export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}/pipe
+    export CUDA_MPS_LOG_DIRECTORY=/tmp/mps_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}/log
+    mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+    nvidia-cuda-mps-control -d
+    trap 'echo quit | nvidia-cuda-mps-control' EXIT
+    export SINGULARITYENV_CUDA_MPS_PIPE_DIRECTORY=$CUDA_MPS_PIPE_DIRECTORY
+    export SINGULARITYENV_CUDA_MPS_LOG_DIRECTORY=$CUDA_MPS_LOG_DIRECTORY
+    MPS_BIND="-B $CUDA_MPS_PIPE_DIRECTORY -B $CUDA_MPS_LOG_DIRECTORY"
+    echo "CUDA MPS enabled: $CUDA_MPS_PIPE_DIRECTORY"
+else
+    MPS_BIND=""
+fi
+
 for (( p=0; p<PROCS_PER_GPU; p++ )); do
     SHARD=$(( GPU_IDX * PROCS_PER_GPU + p ))
     # Stagger launches so the compile phases do not overlap: process 0 pays
@@ -77,6 +102,7 @@ for (( p=0; p<PROCS_PER_GPU; p++ )); do
     # hydra's timestamped default output directory.
     singularity exec \
         -B /mnt/beegfs/ \
+        $MPS_BIND \
         --home /mnt/beegfs/data/AI-REEFSHIELD/tdm/cTDMPC/tdmpc2/ \
         --nv \
         /mnt/beegfs/public/images/tdmpc2.sif \
