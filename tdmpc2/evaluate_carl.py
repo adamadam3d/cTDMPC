@@ -165,48 +165,53 @@ def evaluate_carl(cfg: dict):
         # Use default context from the CARL environment
         default_context = temp_env.get_default_context()
         
-        # Iterate and change every single context feature
-        for feature_name, default_value in default_context.items():
-            if not isinstance(default_value, (int, float)):
-                continue
+        eval_scenarios = []
+        
+        if BIGPICTURE:
+            all_low = default_context.copy()
+            all_high = default_context.copy()
+            for feature_name, default_value in default_context.items():
+                if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
+                    continue
+                all_low[feature_name] = default_value * 0.5
+                all_high[feature_name] = default_value * 1.5
+            eval_scenarios.append(("All Params Low (-50%)", all_low))
+            eval_scenarios.append(("All Params High (+50%)", all_high))
+        else:
+            for feature_name, default_value in default_context.items():
+                if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
+                    continue
+                ctx_low = default_context.copy()
+                ctx_low[feature_name] = default_value * 0.5
+                ctx_high = default_context.copy()
+                ctx_high[feature_name] = default_value * 1.5
+                eval_scenarios.append((f"{feature_name} = {ctx_low[feature_name]:.4f} (Low)", ctx_low))
+                eval_scenarios.append((f"{feature_name} = {ctx_high[feature_name]:.4f} (High)", ctx_high))
                 
-            # Skip timestep features to avoid breaking dm_control's control/physics timestep integer multiple constraint
-            if 'timestep' in feature_name.lower():
-                continue
-                
-            # We vary the default context by evaluating a low (-50%) and high (+50%) value
-            modifications = [
-                ("Low", default_value * 0.5), 
-                ("High", default_value * 1.5)
-            ]
+        for mod_label, ctx_dict in eval_scenarios:
+            print(colored(f'Evaluating {mod_label}', 'cyan'))
+            contexts = {0: ctx_dict}
             
-            for mod_label, mod_val in modifications:
-                # Prepare a context dict overriding the specific feature
-                contexts = {0: default_context.copy()}
-                contexts[0][feature_name] = mod_val
+            env = make_carl_env(cfg, domain, task, contexts=contexts)
+            
+            ep_rewards, ep_successes = [], []
+            for i in range(cfg.eval_episodes):
+                obs, done, ep_reward, t = env.reset(), False, 0, 0
+                while not done:
+                    # Agent act uses task_idx for encoders like task_id
+                    action = agent.act(obs, t0=t==0, task=task_idx)
+                    prev_obs = obs
+                    obs, reward, done, info = env.step(action)
+                    # Multi-task context encoders require updating context
+                    if getattr(cfg, 'multitask', False):
+                        agent.update_context(prev_obs, action, reward, obs)
+                    ep_reward += reward
+                    t += 1
                 
-                print(colored(f'Evaluating {feature_name} = {mod_val:.4f} ({mod_label})', 'cyan'))
-                
-                env = make_carl_env(cfg, domain, task, contexts=contexts)
-                
-                ep_rewards, ep_successes = [], []
-                for i in range(cfg.eval_episodes):
-                    obs, done, ep_reward, t = env.reset(), False, 0, 0
-                    while not done:
-                        # Agent act uses task_idx for encoders like task_id
-                        action = agent.act(obs, t0=t==0, task=task_idx)
-                        prev_obs = obs
-                        obs, reward, done, info = env.step(action)
-                        # Multi-task context encoders require updating context
-                        if getattr(cfg, 'multitask', False):
-                            agent.update_context(prev_obs, action, reward, obs)
-                        ep_reward += reward
-                        t += 1
-                    
-                    ep_rewards.append(ep_reward)
-                    ep_successes.append(info.get('success', 0.0))
-                
-                print(colored(f'  Result -> R: {np.mean(ep_rewards):.01f} | S: {np.mean(ep_successes):.02f}', 'green'))
+                ep_rewards.append(ep_reward)
+                ep_successes.append(info.get('success', 0.0))
+            
+            print(colored(f'  Result -> R: {np.mean(ep_rewards):.01f} | S: {np.mean(ep_successes):.02f}', 'green'))
 
 import sys
 if __name__ == '__main__':
