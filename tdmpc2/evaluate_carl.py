@@ -100,15 +100,6 @@ def make_carl_env(cfg, domain, task, contexts=None):
     env = Timeout(env, max_episode_steps=500)
     env = TensorWrapper(env)
     
-    try:
-        cfg.obs_shape = {k: v.shape for k, v in env.observation_space.spaces.items()}
-    except:
-        cfg.obs_shape = {cfg.get('obs', 'state'): env.observation_space.shape}
-    
-    cfg.action_dim = env.action_space.shape[0]
-    cfg.episode_length = env.max_episode_steps
-    cfg.seed_steps = max(1000, 5*cfg.episode_length)
-    
     return env
 
 @hydra.main(config_name='config', config_path='.')
@@ -198,13 +189,30 @@ def evaluate_carl(cfg: dict):
             for i in range(cfg.eval_episodes):
                 obs, done, ep_reward, t = env.reset(), False, 0, 0
                 while not done:
+                    # Multitask agents expect padded observations and output padded actions
+                    is_mt = getattr(cfg, 'multitask', False)
+                    if is_mt:
+                        expected_obs_dim = max(cfg.obs_shapes)
+                        if obs.shape[0] != expected_obs_dim:
+                            padding = torch.zeros(expected_obs_dim - obs.shape[0], dtype=obs.dtype, device=obs.device)
+                            padded_obs = torch.cat((obs, padding))
+                        else:
+                            padded_obs = obs
+                    else:
+                        padded_obs = obs
+                        
                     # Agent act uses task_idx for encoders like task_id
-                    action = agent.act(obs, t0=t==0, task=task_idx)
-                    prev_obs = obs
-                    obs, reward, done, info = env.step(action)
+                    action = agent.act(padded_obs, t0=t==0, task=task_idx)
+                    prev_obs = padded_obs
+                    
+                    env_action = action[:env.action_space.shape[0]] if is_mt else action
+                    obs, reward, done, info = env.step(env_action)
+                    
                     # Multi-task context encoders require updating context
-                    if getattr(cfg, 'multitask', False):
-                        agent.update_context(prev_obs, action, reward, obs)
+                    if is_mt:
+                        next_padded_obs = torch.cat((obs, torch.zeros(expected_obs_dim - obs.shape[0], dtype=obs.dtype, device=obs.device))) if obs.shape[0] != expected_obs_dim else obs
+                        agent.update_context(prev_obs, action, reward, next_padded_obs)
+                        
                     ep_reward += reward
                     t += 1
                 
