@@ -8,6 +8,8 @@ episodic: false
 
 # evaluation
 checkpoint: ???
+checkpoint_shard: 0  # evaluate_checkpoints.py only: this process evaluates every num_shards-th checkpoint, starting at this index
+num_shards: 1        # evaluate_checkpoints.py only: total number of parallel eval processes sharding the checkpoint list
 eval_episodes: 10
 eval_freq: 150000
 save_freq: 50000
@@ -59,6 +61,7 @@ nce_temp: 0.1            # supervised only: InfoNCE temperature
 # diagnostics / logging
 log_grad_conflict: true   # measure per-task gradient conflict at each eval (multitask only)
 grad_conflict_tasks: 6    # number of tasks sampled per gradient-conflict measurement
+grad_conflict_episodes: 20  # evaluate_checkpoints.py only: episodes loaded per task for grad-conflict metrics (0 = full dataset)
 
 # actor
 log_std_min: -10

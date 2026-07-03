@@ -53,30 +53,70 @@ class OfflineTrainer(Trainer):
 		results[f'score_bottom{k}'] = float(np.sort(scores)[:k].mean())
 		return results
 	
-	def _load_dataset(self):
-		"""Load dataset for offline training."""
+	def _load_dataset(self, episodes_per_task=None):
+		"""
+		Load dataset for offline training.
+
+		If `episodes_per_task` is set, only the first `episodes_per_task`
+		episodes of each task are kept. That is plenty for the gradient-conflict
+		diagnostics in evaluate_checkpoints.py (which only sample a few
+		batch_size-sized batches) and avoids loading the full 345M/550M-transition
+		dataset; the deterministic selection also keeps the diagnostic data
+		identical across checkpoints and invocations. Data files are
+		memory-mapped in this mode so only the selected episodes are read into
+		memory.
+		"""
 		fp = Path(os.path.join(self.cfg.data_dir, '*.pt'))
 		fps = sorted(glob(str(fp)))
 		assert len(fps) > 0, f'No data found at {fp}'
 		print(f'Found {len(fps)} files in {fp}')
 		if len(fps) < (20 if self.cfg.task == 'mt80' else 4):
 			print(f'WARNING: expected 20 files for mt80 task set, 4 files for mt30 task set, found {len(fps)} files.')
-	
+
 		# Create buffer for sampling
 		_cfg = deepcopy(self.cfg)
 		_cfg.episode_length = 101 if self.cfg.task == 'mt80' else 501
-		_cfg.buffer_size = 550_450_000 if self.cfg.task == 'mt80' else 345_690_000
+		if episodes_per_task:
+			quota = torch.full((len(self.cfg.tasks),), episodes_per_task, dtype=torch.int64)
+			_cfg.buffer_size = episodes_per_task * len(self.cfg.tasks) * _cfg.episode_length
+		else:
+			_cfg.buffer_size = 550_450_000 if self.cfg.task == 'mt80' else 345_690_000
 		_cfg.steps = _cfg.buffer_size
 		self.buffer = Buffer(_cfg)
 		for fp in tqdm(fps, desc='Loading data'):
-			td = torch.load(fp, weights_only=False)
+			if episodes_per_task:
+				if not quota.any():
+					break
+				try:
+					td = torch.load(fp, weights_only=False, mmap=True)
+				except Exception:
+					td = torch.load(fp, weights_only=False)
+			else:
+				td = torch.load(fp, weights_only=False)
 			assert td.shape[1] == _cfg.episode_length, \
 				f'Expected episode length {td.shape[1]} to match config episode length {_cfg.episode_length}, ' \
 				f'please double-check your config.'
+			if episodes_per_task:
+				ep_task = td['task'][:, 0].long()
+				keep = []
+				for ti in ep_task.unique().tolist():
+					if quota[ti] > 0:
+						idx = (ep_task == ti).nonzero(as_tuple=True)[0][:int(quota[ti])]
+						keep.append(idx)
+						quota[ti] -= idx.numel()
+				if not keep:
+					continue
+				td = td[torch.cat(keep).sort().values]
 			self.buffer.load(td)
-		expected_episodes = _cfg.buffer_size // _cfg.episode_length
-		if self.buffer.num_eps != expected_episodes:
-			print(f'WARNING: buffer has {self.buffer.num_eps} episodes, expected {expected_episodes} episodes for {self.cfg.task} task set.')
+		if episodes_per_task:
+			short = int((quota > 0).sum())
+			if short:
+				print(f'WARNING: {short} task(s) have fewer than {episodes_per_task} episodes in the dataset.')
+			print(f'Loaded {self.buffer.num_eps} episodes ({episodes_per_task} per task) for gradient-conflict metrics.')
+		else:
+			expected_episodes = _cfg.buffer_size // _cfg.episode_length
+			if self.buffer.num_eps != expected_episodes:
+				print(f'WARNING: buffer has {self.buffer.num_eps} episodes, expected {expected_episodes} episodes for {self.cfg.task} task set.')
 
 	def train(self):
 		"""Train a TD-MPC2 agent."""

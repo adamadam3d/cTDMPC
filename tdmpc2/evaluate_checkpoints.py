@@ -10,6 +10,7 @@ from pathlib import Path
 from time import time
 
 import hydra
+import pandas as pd
 import torch
 from termcolor import colored
 
@@ -59,6 +60,20 @@ def evaluate(cfg: dict):
 		`data_dir`: offline dataset dir; required for gradient-conflict metrics
 		`eval_episodes`: number of episodes to evaluate on per task (default: 10)
 		`exp_name`: use a distinct name to keep the wandb run separate from training
+		`grad_conflict_episodes`: episodes loaded per task for the grad-conflict
+			buffer (default: 20; 0 loads the full dataset as during training)
+		`checkpoint_shard` / `num_shards`: evaluate only every `num_shards`-th
+			checkpoint starting at `checkpoint_shard`, so N parallel processes
+			(e.g. a slurm array) can split the checkpoint list between them
+
+	Besides wandb, all metrics are appended to `<work_dir>/metrics_shard<i>.csv`
+	as a local record that survives wandb outages.
+
+	Checkpoints already evaluated by a previous invocation with the same
+	task/seed/exp_name are skipped (tracked in `<work_dir>/evaluated.txt`;
+	delete that file to force re-evaluation). This makes it safe to resume a
+	crashed sweep, and lets multiple processes shard the work by launching
+	them with disjoint `checkpoint=` globs.
 
 	See config.yaml for a full list of args.
 
@@ -76,11 +91,33 @@ def evaluate(cfg: dict):
 	set_seed(cfg.seed)
 
 	fps = find_checkpoints(cfg.checkpoint)
+	num_shards = cfg.get('num_shards', 1)
+	shard = cfg.get('checkpoint_shard', 0)
+	if num_shards > 1:
+		assert 0 <= shard < num_shards, f'checkpoint_shard must be in [0, {num_shards}), got {shard}.'
+		# Stride over the full sorted list so concurrent shards are disjoint by
+		# construction, regardless of which checkpoints are already evaluated.
+		fps = fps[shard::num_shards]
+		print(colored(f'Shard {shard}/{num_shards}: {len(fps)} checkpoint(s).', 'blue', attrs=['bold']))
 	print(colored(f'Task: {cfg.task}', 'blue', attrs=['bold']))
 	print(colored(f'Model size: {cfg.get("model_size", "default")}', 'blue', attrs=['bold']))
 	print(colored(f'Found {len(fps)} checkpoint(s):', 'blue', attrs=['bold']))
 	for fp in fps:
 		print(colored(f'  {fp}', 'blue'))
+
+	# Skip checkpoints already evaluated by a previous invocation, so a crashed
+	# or extended sweep does not redo finished work.
+	done_fp = Path(cfg.work_dir) / 'evaluated.txt'
+	done = set(done_fp.read_text().split()) if done_fp.exists() else set()
+	if done:
+		skipped = [fp for fp in fps if fp.stem in done]
+		if skipped:
+			print(colored(f'Skipping {len(skipped)} checkpoint(s) already evaluated '
+				f'(delete {done_fp} to force re-evaluation).', 'yellow', attrs=['bold']))
+			fps = [fp for fp in fps if fp.stem not in done]
+	if not fps:
+		print(colored('All checkpoints have already been evaluated.', 'yellow', attrs=['bold']))
+		return
 
 	trainer = OfflineTrainer(
 		cfg=cfg,
@@ -94,12 +131,13 @@ def evaluate(cfg: dict):
 	# so they are only available when `data_dir` is provided.
 	log_grad_conflict = cfg.get('log_grad_conflict', True)
 	if log_grad_conflict and cfg.data_dir != '???':
-		trainer._load_dataset()
+		trainer._load_dataset(episodes_per_task=cfg.get('grad_conflict_episodes', 20) or None)
 	elif log_grad_conflict:
 		log_grad_conflict = False
 		print(colored('data_dir not set: skipping gradient-conflict metrics.', 'yellow', attrs=['bold']))
 
 	start_time = time()
+	csv_fp = Path(cfg.work_dir) / f'metrics_shard{shard}.csv'
 	for fp in fps:
 		step = trainer.agent.load(fp)
 		if not step and fp.stem.isdigit():
@@ -114,6 +152,11 @@ def evaluate(cfg: dict):
 			metrics.update(trainer.agent.grad_conflict(trainer.buffer))
 		trainer.logger.pprint_multitask(metrics, cfg)
 		trainer.logger.log(metrics, 'pretrain')
+		# Local, wandb-independent record of all metrics, one CSV per shard;
+		# append so resumed invocations keep earlier rows.
+		pd.DataFrame([metrics]).to_csv(csv_fp, mode='a', header=not csv_fp.exists(), index=False)
+		with open(done_fp, 'a') as f:
+			f.write(f'{fp.stem}\n')
 	trainer.logger.finish()
 
 
