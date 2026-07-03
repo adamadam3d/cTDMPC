@@ -32,7 +32,15 @@
 
 SEEDS=(3 5 6 7 8)
 GPUS_PER_SEED=4
-PROCS_PER_GPU=4
+# Overridable at submit time for denser packing on big nodes, e.g. on the
+# 128-cpu/500G A100 node:
+#   sbatch --partition=gpu_ampere --cpus-per-task=32 --mem=120G \
+#          --export=ALL,PROCS_PER_GPU=8 slurm/hpc/eval_taskid_50k.sh
+# (CLI flags override the #SBATCH directives above.) NOTE: num_shards depends
+# on this value, so do not mix packings within one seed at the same time --
+# concurrent jobs with different PROCS_PER_GPU would evaluate overlapping
+# checkpoint sets.
+PROCS_PER_GPU=${PROCS_PER_GPU:-4}
 
 SEED=${SEEDS[$(( SLURM_ARRAY_TASK_ID / GPUS_PER_SEED ))]}
 GPU_IDX=$(( SLURM_ARRAY_TASK_ID % GPUS_PER_SEED ))
