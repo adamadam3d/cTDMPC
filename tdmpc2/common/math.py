@@ -64,18 +64,23 @@ def gaussian_kl(mu, logvar):
 	return 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).sum(-1)
 
 
-def gaussian_kl_pair(mu_q, logvar_q, mu_p, logvar_p):
+def gaussian_kl_pair(mu_q, logvar_q, mu_p, logvar_p, free_bits=0.):
 	"""
 	KL divergence between two diagonal Gaussians KL(q || p), summed over the
 	last dim. Used for VariBAD's sequential KL, where the prior for the belief
-	at step t is the belief at step t-1.
+	at step t is the belief at step t-1. With `free_bits` > 0, only the KL in
+	excess of `free_bits` nats per dimension is penalized, so the belief keeps
+	that much information for free (guards against collapse to a static belief).
 	"""
-	return 0.5 * (
+	kl = 0.5 * (
 		logvar_p - logvar_q
 		+ (logvar_q - logvar_p).exp()
 		+ (mu_q - mu_p).pow(2) * (-logvar_p).exp()
 		- 1
-	).sum(-1)
+	)
+	if free_bits > 0:
+		kl = (kl - free_bits).clamp(min=0.)
+	return kl.sum(-1)
 
 
 def info_nce(z, z_pos, labels, temperature=0.1):

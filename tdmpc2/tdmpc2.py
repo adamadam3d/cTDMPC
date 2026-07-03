@@ -41,6 +41,13 @@ class TDMPC2(torch.nn.Module):
 		print('Episode length:', cfg.episode_length)
 		print('Discount factor:', self.discount)
 		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
+		# Linear KL warmup (pearl/varibad): the fraction lives in a buffer so the
+		# compiled _update reads a tensor rather than a per-call Python constant;
+		# it is advanced eagerly in update(). Stays at 1 when warmup is disabled.
+		self._update_count = 0
+		self._kl_frac = torch.nn.Buffer(torch.ones((), device=self.device))
+		if cfg.multitask and cfg.get('kl_anneal_steps', 0) > 0:
+			self._kl_frac.fill_(0.)
 		if cfg.multitask:
 			if cfg.context_encoder == 'supervised' and cfg.context_loss == 'nce':
 				assert cfg.num_context >= 2, \
@@ -430,6 +437,44 @@ class TDMPC2(torch.nn.Module):
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		return reward + discount * (1-terminated) * self.model.Q(next_z, action, z_ctx, return_type='min', target=True)
 
+	def _varibad_recon(self, ctx, beliefs):
+		"""
+		VariBAD ELBO reconstruction term: decode the reward of *every* tuple in
+		the context window from belief samples taken at `recon_beliefs` context
+		steps (one of which is always early). Decoding tuples that come *after*
+		the sampled step is what forces the belief to identify the task early
+		instead of lagging behind the evidence.
+
+		Args:
+			ctx (torch.Tensor): Context tuples [s, a, r, s'], shape (B, N, ctx_dim).
+			beliefs (torch.Tensor): Belief sequence [mu, logvar], shape (B, N+1, task_dim).
+
+		Returns:
+			torch.Tensor: Scalar reconstruction loss.
+		"""
+		obs_dim = self.cfg.obs_shape['state'][0]
+		act_dim = self.cfg.action_dim
+		s = ctx[..., :obs_dim]
+		a = ctx[..., obs_dim:obs_dim+act_dim]
+		r = ctx[..., obs_dim+act_dim]
+		B, N = ctx.shape[0], ctx.shape[1]
+		K = self.cfg.recon_beliefs
+		# One early belief index (trains fast identification) + K-1 uniform over
+		# the full sequence (including 0 = prior).
+		early = torch.randint(0, max(2, N//8), (B, 1), device=ctx.device)
+		rest = torch.randint(0, beliefs.shape[1], (B, K-1), device=ctx.device)
+		k_idx = torch.cat([early, rest], dim=1)
+		b_k = beliefs.gather(1, k_idx.unsqueeze(-1).expand(-1, -1, beliefs.shape[-1]))
+		mu_k, logvar_k = b_k.chunk(2, dim=-1)
+		z_k = mu_k + torch.randn_like(mu_k) * torch.exp(0.5*logvar_k)
+		dec_in = torch.cat([
+			s.unsqueeze(1).expand(-1, K, -1, -1),
+			a.unsqueeze(1).expand(-1, K, -1, -1),
+			z_k.unsqueeze(2).expand(-1, -1, N, -1),
+		], dim=-1)
+		r_pred = self.model.decode_reward(dec_in).squeeze(-1)
+		return F.mse_loss(r_pred, r.unsqueeze(1).expand(-1, K, -1))
+
 	def _update(self, obs, action, reward, terminated, task=None, ctx=None):
 		# Switch to train mode before any forward pass that participates in the
 		# backward graph. The varibad belief rollout uses a cuDNN RNN, whose
@@ -452,6 +497,10 @@ class TDMPC2(torch.nn.Module):
 			beliefs = self.model.belief_rollout(ctx)
 			t_idx = torch.randint(0, beliefs.shape[1], (beliefs.shape[0],), device=beliefs.device)
 			z_ctx = beliefs.gather(1, t_idx.view(-1, 1, 1).expand(-1, 1, beliefs.shape[-1])).squeeze(1)
+			# Faithful VariBAD: the belief conditions the world model but is
+			# trained purely by the ELBO (reconstruction + sequential KL), so the
+			# world model has no incentive to prefer a collapsed belief.
+			z_ctx = z_ctx.detach()
 		else:  # supervised
 			z_ctx = self.model.infer_ctx(ctx)
 
@@ -494,15 +543,27 @@ class TDMPC2(torch.nn.Module):
 		# Context regulariser, per encoder: KL for the probabilistic encoders
 		# (pearl: KL to the N(0,I) prior; varibad: sequential KL belief_t || belief_{t-1})
 		# or a supervised loss (task classification / supervised InfoNCE).
-		kl_loss, context_loss, context_acc = 0., 0., 0.
+		kl_loss, context_loss, context_acc, recon_loss = 0., 0., 0., 0.
 		if self.cfg.multitask and self.cfg.context_encoder == 'pearl':
 			kl_loss = math.gaussian_kl(ctx_mu, ctx_logvar).mean()
-			ctx_reg = self.cfg.kl_coef * kl_loss
+			ctx_reg = self._kl_frac * self.cfg.kl_coef * kl_loss
 		elif self.cfg.multitask and self.cfg.context_encoder == 'varibad':
 			mus, logvars = beliefs.chunk(2, dim=-1)
 			kl_loss = math.gaussian_kl_pair(
-				mus[:, 1:], logvars[:, 1:], mus[:, :-1], logvars[:, :-1]).mean()
-			ctx_reg = self.cfg.kl_coef * kl_loss
+				mus[:, 1:], logvars[:, 1:], mus[:, :-1], logvars[:, :-1],
+				free_bits=self.cfg.kl_free_bits).mean()
+			# ELBO: the reconstruction term is the engine that forces the belief
+			# to identify the task; the sequential KL is its brake.
+			recon_loss = self._varibad_recon(ctx, beliefs)
+			ctx_reg = self._kl_frac * self.cfg.kl_coef * kl_loss \
+				+ self.cfg.recon_coef * recon_loss
+			# Detached probe: input is the (already detached) belief mean, so the
+			# CE trains only the classifier head, never the encoder. It exists to
+			# make context_loss/context_acc meaningful diagnostics for varibad.
+			probe_logits = self.model.classify_ctx(z_ctx.chunk(2, dim=-1)[0])
+			context_loss = F.cross_entropy(probe_logits, task)
+			context_acc = (probe_logits.argmax(-1) == task).float().mean()
+			ctx_reg = ctx_reg + context_loss
 		elif self.cfg.multitask and self.cfg.context_encoder == 'supervised':
 			if self.cfg.context_loss == 'nce':
 				# Two contrastive views from independent halves of the same
@@ -550,6 +611,7 @@ class TDMPC2(torch.nn.Module):
 			"value_loss": value_loss,
 			"termination_loss": termination_loss,
 			"kl_loss": kl_loss,
+			"recon_loss": recon_loss,
 			"context_loss": context_loss,
 			"context_acc": context_acc,
 			"total_loss": total_loss,
@@ -588,6 +650,10 @@ class TDMPC2(torch.nn.Module):
 		if task is not None:
 			kwargs["task"] = task
 			kwargs["ctx"] = ctx
+		if self.cfg.multitask and self.cfg.get('kl_anneal_steps', 0) > 0:
+			# Advance the linear KL warmup eagerly (outside the compiled graph).
+			self._update_count += 1
+			self._kl_frac.fill_(min(1., self._update_count / self.cfg.kl_anneal_steps))
 		torch.compiler.cudagraph_mark_step_begin()
 		return self._update(obs, action, reward, terminated, **kwargs)
 
@@ -612,6 +678,7 @@ class TDMPC2(torch.nn.Module):
 			beliefs = self.model.belief_rollout(ctx)
 			t_idx = torch.randint(0, beliefs.shape[1], (beliefs.shape[0],), device=beliefs.device)
 			z_ctx = beliefs.gather(1, t_idx.view(-1, 1, 1).expand(-1, 1, beliefs.shape[-1])).squeeze(1)
+			z_ctx = z_ctx.detach()  # mirror _update: encoder trained by ELBO only
 		else:  # supervised
 			z_ctx = self.model.infer_ctx(ctx)
 		with torch.no_grad():
@@ -644,9 +711,14 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.context_encoder == 'pearl':
 			loss = loss + self.cfg.kl_coef * math.gaussian_kl(ctx_mu, ctx_logvar).mean()
 		elif self.cfg.context_encoder == 'varibad':
+			# Mirrors _update's ELBO at full kl_coef (no warmup: the diagnostic
+			# measures the asymptotic objective). The detached probe is omitted
+			# since it never contributes gradient to the encoder.
 			mus, logvars = beliefs.chunk(2, dim=-1)
 			loss = loss + self.cfg.kl_coef * math.gaussian_kl_pair(
-				mus[:, 1:], logvars[:, 1:], mus[:, :-1], logvars[:, :-1]).mean()
+				mus[:, 1:], logvars[:, 1:], mus[:, :-1], logvars[:, :-1],
+				free_bits=self.cfg.kl_free_bits).mean()
+			loss = loss + self.cfg.recon_coef * self._varibad_recon(ctx, beliefs)
 		elif self.cfg.context_encoder == 'supervised' and self.cfg.context_loss != 'nce':  # ce
 			loss = loss + self.cfg.context_coef * F.cross_entropy(self.model.classify_ctx(z_ctx), task)
 		return loss

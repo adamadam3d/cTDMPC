@@ -37,6 +37,16 @@ class WorldModel(nn.Module):
 					'embed': layers.NormedLinear(ctx_dim, cfg.enc_dim),
 					'gru': nn.GRU(cfg.enc_dim, cfg.enc_dim, batch_first=True),
 					'head': nn.Linear(cfg.enc_dim, cfg.task_dim),
+					# ELBO reward decoder p(r_i | s_i, a_i, z): the information-forcing
+					# half of VariBAD. The belief is trained to reconstruct every reward
+					# in the window (past *and* future tuples) from z sampled at a
+					# context step, which is what forces early task identification.
+					'dec': layers.mlp(cfg.obs_shape['state'][0] + cfg.action_dim + cfg.task_dim//2,
+						2*[cfg.enc_dim], 1),
+					# Detached diagnostic probe: task logits from the belief mean.
+					# Trained on mu.detach(), so it never shapes the encoder; it only
+					# makes context_acc meaningful for varibad.
+					'clf': nn.Linear(cfg.task_dim//2, len(cfg.tasks)),
 				})
 			elif cfg.context_encoder == 'supervised':
 				self._ctx_enc = nn.ModuleDict({
@@ -142,8 +152,19 @@ class WorldModel(nn.Module):
 		return x.sum(dim=-2) / n
 
 	def classify_ctx(self, z):
-		"""Predict task logits from the task latent (supervised encoder)."""
+		"""
+		Predict task logits from the task latent. A training loss for the
+		supervised encoder; a detached diagnostic probe (input: belief mean)
+		for varibad.
+		"""
 		return self._ctx_enc['clf'](z)
+
+	def decode_reward(self, x):
+		"""
+		ELBO reward decoder p(r_i | s_i, a_i, z) (VariBAD only). `x` is the
+		concatenation [s_i, a_i, z] with z the belief sample (mu dim).
+		"""
+		return self._ctx_enc['dec'](x)
 
 	def task_latent(self, task):
 		"""Look up the learned per-task embedding (task_id / original TD-MPC2)."""
@@ -152,7 +173,10 @@ class WorldModel(nn.Module):
 	def _belief(self, hidden):
 		"""Project GRU hidden states to belief vectors [mu, logvar] (VariBAD)."""
 		mu, logvar = self._ctx_enc['head'](hidden).chunk(2, dim=-1)
-		return torch.cat([mu, logvar.clamp(-10, 2)], dim=-1)
+		# Floor of -4 (std >= ~0.14) rather than -10: keeps the sequential KL's
+		# gradient alive at the confident end, so the belief cannot saturate
+		# into a frozen, gradient-dead overconfident state.
+		return torch.cat([mu, logvar.clamp(-4, 2)], dim=-1)
 
 	def belief_rollout(self, ctx):
 		"""

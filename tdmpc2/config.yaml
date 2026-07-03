@@ -48,6 +48,10 @@ context_encoder: pearl   # pearl | varibad | supervised | task_id (original TD-M
 num_context: 64
 context_window: 100      # online buffer length (pearl, supervised)
 kl_coef: 0.1             # context-posterior KL weight (pearl, varibad)
+kl_anneal_steps: 0       # linear KL warmup over this many updates (pearl, varibad); 0 disables
+kl_free_bits: 0.0        # varibad only: per-dim sequential-KL floor in nats; 0 disables
+recon_coef: 1.0          # varibad only: weight of the ELBO reward-reconstruction term
+recon_beliefs: 4         # varibad only: belief timesteps decoded per context window
 context_loss: ce         # supervised only: ce (task classification) | nce (supervised InfoNCE)
 context_coef: 1.0        # supervised only: weight of the context loss
 nce_temp: 0.1            # supervised only: InfoNCE temperature
