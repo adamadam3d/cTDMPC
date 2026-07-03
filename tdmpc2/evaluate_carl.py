@@ -40,7 +40,12 @@ class CARL_TDMPC2_Wrapper(gym.Wrapper):
         if isinstance(obs, tuple):
             obs = obs[0]
         if isinstance(obs, dict):
-            obs = np.concatenate([np.asarray(v).flatten() for v in obs.values()], dtype=np.float32)
+            flat_obs = []
+            for k, v in obs.items():
+                if k == 'context' or isinstance(v, (dict, str)):
+                    continue
+                flat_obs.append(np.asarray(v, dtype=np.float32).flatten())
+            obs = np.concatenate(flat_obs, dtype=np.float32)
         return np.array(obs, dtype=np.float32)
 
     def step(self, action):
@@ -61,7 +66,12 @@ class CARL_TDMPC2_Wrapper(gym.Wrapper):
                 break
                 
         if isinstance(obs, dict):
-            obs = np.concatenate([np.asarray(v).flatten() for v in obs.values()], dtype=np.float32)
+            flat_obs = []
+            for k, v in obs.items():
+                if k == 'context' or isinstance(v, (dict, str)):
+                    continue
+                flat_obs.append(np.asarray(v, dtype=np.float32).flatten())
+            obs = np.concatenate(flat_obs, dtype=np.float32)
         return np.array(obs, dtype=np.float32), reward, done, info
 
 from envs.wrappers.timeout import Timeout
