@@ -132,7 +132,7 @@ class Buffer():
 			terminated = torch.zeros_like(reward)
 		task = td.get('task', None)
 		if task is not None:
-			task = task[0].contiguous()
+			task = task[0].long().contiguous()
 		return obs, action, reward, terminated, task
 
 	def _build_ctx_index(self):
