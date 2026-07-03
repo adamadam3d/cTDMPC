@@ -13,13 +13,14 @@ from common.seed import set_seed
 from tdmpc2 import TDMPC2
 
 # CARL imports
-from carl.envs import CARLDmcWalkerEnv, CARLDmcFishEnv, CARLDmcFingerEnv
+from carl.envs import CARLDmcWalkerEnv, CARLDmcFishEnv, CARLDmcFingerEnv, CARLDmcQuadrupedEnv
 
 # Mapping domains to their corresponding CARL environments
 CARL_ENV_MAP = {
     'walker': CARLDmcWalkerEnv,
     'fish': CARLDmcFishEnv,
-    'finger': CARLDmcFingerEnv
+    'finger': CARLDmcFingerEnv,
+    'quadruped': CARLDmcQuadrupedEnv
 }
 
 from envs.dmcontrol import suite
@@ -117,19 +118,23 @@ def evaluate_carl(cfg: dict):
     
     BIGPICTURE = os.environ.get('BIGPICTURE') == '1' or cfg.get('BIGPICTURE', False) or cfg.get('bigpicture', False)
     
-    if BIGPICTURE:
-        target_tasks = ['walker-run', 'fish-swim', 'finger-spin']
-        print(colored("BIGPICTURE mode (-B) enabled: running walker-run, fish-swim, finger-spin", "yellow", attrs=['bold']))
+    eval_tasks_override = os.environ.get('EVAL_TASKS')
+    if eval_tasks_override:
+        target_tasks = eval_tasks_override.split(',')
+    elif BIGPICTURE:
+        target_tasks = ['walker-run', 'fish-swim', 'finger-spin', 'quadruped-walk']
+        print(colored("BIGPICTURE mode (-B) enabled: running walker-run, fish-swim, finger-spin, quadruped-walk", "yellow", attrs=['bold']))
         print(colored("Note: cup-spin is omitted because the CARL benchmark library does not implement a context wrapper for the cup domain.", "red"))
     else:
         # Subset of mt30 for walker, fish, and finger
         target_tasks = [
             'walker-stand', 'walker-walk', 'walker-run', 'walker-walk-backwards', 'walker-run-backwards',
             'fish-swim',
-            'finger-spin', 'finger-turn-easy', 'finger-turn-hard'
+            'finger-spin', 'finger-turn-easy', 'finger-turn-hard',
+            'quadruped-walk', 'quadruped-run'
         ]
     
-    print(colored('Evaluating CARL modified environments for walker, fish, and finger tasks.', 'yellow', attrs=['bold']))
+    print(colored(f'Evaluating CARL modified environments for tasks: {target_tasks}', 'yellow', attrs=['bold']))
     
     # Load agent (using original make_env to properly initialize config for multitask, e.g., cfg.tasks)
     _ = make_original_env(cfg)
@@ -151,8 +156,12 @@ def evaluate_carl(cfg: dict):
             if task_str in cfg.tasks:
                 task_idx = cfg.tasks.index(task_str)
             else:
-                print(colored(f'Task {task_str} not found in cfg.tasks. Skipping.', 'red'))
-                continue
+                print(colored(f'Task {task_str} not found in training tasks. Evaluating zero-shot transfer!', 'magenta'))
+                if cfg.context_encoder == 'task_id':
+                    print(colored(f'WARNING: task_id encoder cannot do zero-shot transfer properly. It will blindly use the embedding of the first task!', 'red'))
+                # We need a task_idx for action masking in TD-MPC2. 
+                # Pick the task index that has the largest action dimension to prevent masking valid unseen actions.
+                task_idx = int(np.argmax(cfg.action_dims))
         
         print(colored(f'\n--- Task: {task_str} ---', 'magenta', attrs=['bold']))
         
@@ -272,4 +281,9 @@ if __name__ == '__main__':
     if '-L' in sys.argv:
         os.environ['RUN_LOW'] = '1'
         sys.argv.remove('-L')
+    if '--eval_tasks' in sys.argv:
+        idx = sys.argv.index('--eval_tasks')
+        os.environ['EVAL_TASKS'] = sys.argv[idx + 1]
+        sys.argv.pop(idx)
+        sys.argv.pop(idx)
     evaluate_carl()
