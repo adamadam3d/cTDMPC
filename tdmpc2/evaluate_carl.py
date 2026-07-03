@@ -234,9 +234,11 @@ def evaluate_carl(cfg: dict):
                     is_mt = getattr(cfg, 'multitask', False)
                     if is_mt:
                         expected_obs_dim = max(cfg.obs_shapes)
-                        if obs.shape[0] != expected_obs_dim:
+                        if obs.shape[0] < expected_obs_dim:
                             padding = torch.zeros(expected_obs_dim - obs.shape[0], dtype=obs.dtype, device=obs.device)
                             padded_obs = torch.cat((obs, padding))
+                        elif obs.shape[0] > expected_obs_dim:
+                            padded_obs = obs[:expected_obs_dim]
                         else:
                             padded_obs = obs
                     else:
@@ -251,7 +253,12 @@ def evaluate_carl(cfg: dict):
                     
                     # Multi-task context encoders require updating context
                     if is_mt:
-                        next_padded_obs = torch.cat((obs, torch.zeros(expected_obs_dim - obs.shape[0], dtype=obs.dtype, device=obs.device))) if obs.shape[0] != expected_obs_dim else obs
+                        if obs.shape[0] < expected_obs_dim:
+                            next_padded_obs = torch.cat((obs, torch.zeros(expected_obs_dim - obs.shape[0], dtype=obs.dtype, device=obs.device)))
+                        elif obs.shape[0] > expected_obs_dim:
+                            next_padded_obs = obs[:expected_obs_dim]
+                        else:
+                            next_padded_obs = obs
                         agent.update_context(prev_obs, action, reward, next_padded_obs)
                         
                     ep_reward += reward
