@@ -118,12 +118,19 @@ def evaluate_carl(cfg: dict):
     cfg = parse_cfg(cfg)
     set_seed(cfg.seed)
     
-    # Subset of mt30 for walker, fish, and finger
-    target_tasks = [
-        'walker-stand', 'walker-walk', 'walker-run', 'walker-walk-backwards', 'walker-run-backwards',
-        'fish-swim',
-        'finger-spin', 'finger-turn-easy', 'finger-turn-hard'
-    ]
+    BIGPICTURE = os.environ.get('BIGPICTURE') == '1' or cfg.get('BIGPICTURE', False) or cfg.get('bigpicture', False)
+    
+    if BIGPICTURE:
+        target_tasks = ['walker-run', 'fish-swim', 'finger-spin']
+        print(colored("BIGPICTURE mode (-B) enabled: running walker-run, fish-swim, finger-spin", "yellow", attrs=['bold']))
+        print(colored("Note: cup-spin is omitted because the CARL benchmark library does not implement a context wrapper for the cup domain.", "red"))
+    else:
+        # Subset of mt30 for walker, fish, and finger
+        target_tasks = [
+            'walker-stand', 'walker-walk', 'walker-run', 'walker-walk-backwards', 'walker-run-backwards',
+            'fish-swim',
+            'finger-spin', 'finger-turn-easy', 'finger-turn-hard'
+        ]
     
     print(colored('Evaluating CARL modified environments for walker, fish, and finger tasks.', 'yellow', attrs=['bold']))
     
@@ -201,5 +208,9 @@ def evaluate_carl(cfg: dict):
                 
                 print(colored(f'  Result -> R: {np.mean(ep_rewards):.01f} | S: {np.mean(ep_successes):.02f}', 'green'))
 
+import sys
 if __name__ == '__main__':
+    if '-B' in sys.argv:
+        os.environ['BIGPICTURE'] = '1'
+        sys.argv.remove('-B')
     evaluate_carl()
