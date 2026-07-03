@@ -157,27 +157,49 @@ def evaluate_carl(cfg: dict):
         default_context = temp_env.get_default_context()
         
         eval_scenarios = []
+        RUN_RANDOM = os.environ.get('RUN_RANDOM') == '1'
+        RUN_HIGH = os.environ.get('RUN_HIGH') == '1'
+        RUN_LOW = os.environ.get('RUN_LOW') == '1'
+        if not (RUN_RANDOM or RUN_HIGH or RUN_LOW):
+            RUN_RANDOM = RUN_HIGH = RUN_LOW = True
         
         if BIGPICTURE:
             all_low = default_context.copy()
             all_high = default_context.copy()
+            all_random = default_context.copy()
             for feature_name, default_value in default_context.items():
                 if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
                     continue
                 all_low[feature_name] = default_value * 0.5
                 all_high[feature_name] = default_value * 1.5
-            eval_scenarios.append(("All Params Low (-50%)", all_low))
-            eval_scenarios.append(("All Params High (+50%)", all_high))
+                # Random multiplier between 0.5 and 1.5
+                all_random[feature_name] = default_value * np.random.uniform(0.5, 1.5)
+            if RUN_RANDOM:
+                eval_scenarios.append(("All Params Random (0.5x - 1.5x)", all_random))
+            if RUN_LOW:
+                eval_scenarios.append(("All Params Low (-50%)", all_low))
+            if RUN_HIGH:
+                eval_scenarios.append(("All Params High (+50%)", all_high))
         else:
             for feature_name, default_value in default_context.items():
                 if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
                     continue
                 ctx_low = default_context.copy()
                 ctx_low[feature_name] = default_value * 0.5
+                
                 ctx_high = default_context.copy()
                 ctx_high[feature_name] = default_value * 1.5
-                eval_scenarios.append((f"{feature_name} = {ctx_low[feature_name]:.4f} (Low)", ctx_low))
-                eval_scenarios.append((f"{feature_name} = {ctx_high[feature_name]:.4f} (High)", ctx_high))
+                
+                ctx_random = default_context.copy()
+                random_mult = np.random.uniform(0.5, 1.5)
+                ctx_random[feature_name] = default_value * random_mult
+                
+                if RUN_RANDOM:
+                    eval_scenarios.append((f"{feature_name} = {ctx_random[feature_name]:.4f} (Random {random_mult:.2f}x)", ctx_random))
+                if RUN_LOW:
+                    eval_scenarios.append((f"{feature_name} = {ctx_low[feature_name]:.4f} (Low)", ctx_low))
+                if RUN_HIGH:
+                    eval_scenarios.append((f"{feature_name} = {ctx_high[feature_name]:.4f} (High)", ctx_high))
                 
         for mod_label, ctx_dict in eval_scenarios:
             print(colored(f'Evaluating {mod_label}', 'cyan'))
@@ -226,4 +248,13 @@ if __name__ == '__main__':
     if '-B' in sys.argv:
         os.environ['BIGPICTURE'] = '1'
         sys.argv.remove('-B')
+    if '-r' in sys.argv:
+        os.environ['RUN_RANDOM'] = '1'
+        sys.argv.remove('-r')
+    if '-H' in sys.argv:
+        os.environ['RUN_HIGH'] = '1'
+        sys.argv.remove('-H')
+    if '-L' in sys.argv:
+        os.environ['RUN_LOW'] = '1'
+        sys.argv.remove('-L')
     evaluate_carl()
