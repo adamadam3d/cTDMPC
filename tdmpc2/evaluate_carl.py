@@ -13,13 +13,13 @@ from common.seed import set_seed
 from tdmpc2 import TDMPC2
 
 # CARL imports
-from carl.envs import CARLDMCWalkerEnv, CARLDMCFishEnv, CARLDMCFingerEnv
+from carl.envs import CARLDmcWalkerEnv, CARLDmcFishEnv, CARLDmcFingerEnv
 
 # Mapping domains to their corresponding CARL environments
 CARL_ENV_MAP = {
-    'walker': CARLDMCWalkerEnv,
-    'fish': CARLDMCFishEnv,
-    'finger': CARLDMCFingerEnv
+    'walker': CARLDmcWalkerEnv,
+    'fish': CARLDmcFishEnv,
+    'finger': CARLDmcFingerEnv
 }
 
 from envs.dmcontrol import DMControlWrapper, suite
