@@ -66,6 +66,15 @@ if [ -z "$WANDB_API_KEY" ]; then
 fi
 export SINGULARITYENV_WANDB_API_KEY=$WANDB_API_KEY
 
+# ----------------------------------------------------------------------------
+# Thread Limiting Logic: Prevent CPU oversubscription on shared nodes
+# Restricts math libraries to the exact number of allocated CPUs per task
+# ----------------------------------------------------------------------------
+export SINGULARITYENV_OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export SINGULARITYENV_MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export SINGULARITYENV_OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export SINGULARITYENV_NUMEXPR_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
 singularity exec \
     -B /mnt/beegfs/ \
     --home /mnt/beegfs/data/AI-REEFSHIELD/tdm/cTDMPC/tdmpc2/ \
