@@ -341,18 +341,22 @@ if __name__ == '__main__':
         os.environ['EVAL_TASKS'] = sys.argv[idx + 1]
         sys.argv.pop(idx)
         sys.argv.pop(idx)
+    DEFAULT_SWEEP = '0.1,0.2,0.3,0.4,0.5'
     if '--sweep' in sys.argv:
         idx = sys.argv.index('--sweep')
-        sweep_arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ''
-        if not sweep_arg or '=' in sweep_arg:
-            print("Error: --sweep requires a comma-separated list of magnitudes, e.g. --sweep 0.1,0.2,0.3,0.4,0.5")
-            sys.exit(1)
-        try:
-            [float(x) for x in sweep_arg.split(',')]
-        except ValueError:
-            print(f"Error: --sweep values must be numbers, got: {sweep_arg!r}")
-            sys.exit(1)
+        has_value = idx + 1 < len(sys.argv) and '=' not in sys.argv[idx + 1]
+        if has_value:
+            sweep_arg = sys.argv[idx + 1]
+            try:
+                [float(x) for x in sweep_arg.split(',')]
+            except ValueError:
+                print(f"Error: --sweep values must be numbers, got: {sweep_arg!r}")
+                sys.exit(1)
+            sys.argv.pop(idx)
+            sys.argv.pop(idx)
+        else:
+            sweep_arg = DEFAULT_SWEEP
+            print(f"No value given for --sweep; defaulting to {DEFAULT_SWEEP}")
+            sys.argv.pop(idx)
         os.environ['SWEEP_SCALES'] = sweep_arg
-        sys.argv.pop(idx)
-        sys.argv.pop(idx)
     evaluate_carl()
