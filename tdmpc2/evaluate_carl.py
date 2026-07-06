@@ -115,9 +115,19 @@ def evaluate_carl(cfg: dict):
         cfg.seed = int(eval_seed)
         
     set_seed(cfg.seed)
-    
+    rng = np.random.default_rng(cfg.seed)
+
+    # --sweep s1,s2,... : magnitude sweep over ALL context params at once, scaled
+    # within [1-s, 1+s] per value of s (s=0 is always included as the unperturbed
+    # baseline). Produces a dose-response curve instead of fixed 0.5x/1.5x points.
+    SWEEP_SCALES = os.environ.get('SWEEP_SCALES')
+    sweep_values = sorted(set([0.0] + [float(x) for x in SWEEP_SCALES.split(',')])) if SWEEP_SCALES else None
+    if sweep_values is not None:
+        print(colored(f'Sweep mode enabled: magnitudes s={sweep_values} '
+                      f'(all context params scaled within [1-s, 1+s] simultaneously)', 'yellow', attrs=['bold']))
+
     BIGPICTURE = os.environ.get('BIGPICTURE') == '1' or cfg.get('BIGPICTURE', False) or cfg.get('bigpicture', False)
-    
+
     eval_tasks_override = os.environ.get('EVAL_TASKS')
     if eval_tasks_override:
         target_tasks = eval_tasks_override.split(',')
@@ -170,56 +180,73 @@ def evaluate_carl(cfg: dict):
         temp_env = carl_env_cls(task=task)
         # Use default context from the CARL environment
         default_context = temp_env.get_default_context()
-        
+        baseline_reward = None  # set on the first (s=0) scenario when sweeping
+
         eval_scenarios = []
-        RUN_RANDOM = os.environ.get('RUN_RANDOM') == '1'
-        RUN_HIGH = os.environ.get('RUN_HIGH') == '1'
-        RUN_LOW = os.environ.get('RUN_LOW') == '1'
-        RUN_NORMAL = os.environ.get('RUN_NORMAL') == '1'
-        if not (RUN_RANDOM or RUN_HIGH or RUN_LOW or RUN_NORMAL):
-            RUN_RANDOM = RUN_HIGH = RUN_LOW = RUN_NORMAL = True
-            
-        if RUN_NORMAL:
-            eval_scenarios.append(("Baseline / Normal (1.0x)", default_context.copy()))
-        
-        if BIGPICTURE:
-            all_low = default_context.copy()
-            all_high = default_context.copy()
-            all_random = default_context.copy()
-            for feature_name, default_value in default_context.items():
-                if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
+
+        if sweep_values is not None:
+            # Dose-response sweep: one scenario per magnitude s, all numeric context
+            # params scaled simultaneously within [1-s, 1+s]. s=0 is the unperturbed
+            # baseline (always first, since sweep_values is sorted and includes 0.0).
+            for s in sweep_values:
+                if s == 0.0:
+                    eval_scenarios.append((f'Sweep s=0.00 (Baseline)', default_context.copy()))
                     continue
-                all_low[feature_name] = default_value * 0.5
-                all_high[feature_name] = default_value * 1.5
-                # Random multiplier between 0.5 and 1.5
-                all_random[feature_name] = default_value * np.random.uniform(0.5, 1.5)
-            if RUN_RANDOM:
-                eval_scenarios.append(("All Params Random (0.5x - 1.5x)", all_random))
-            if RUN_LOW:
-                eval_scenarios.append(("All Params Low (-50%)", all_low))
-            if RUN_HIGH:
-                eval_scenarios.append(("All Params High (+50%)", all_high))
+                ctx = default_context.copy()
+                for feature_name, default_value in default_context.items():
+                    if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
+                        continue
+                    ctx[feature_name] = default_value * rng.uniform(1.0 - s, 1.0 + s)
+                eval_scenarios.append((f'Sweep s={s:.2f} (scale [{1-s:.2f}, {1+s:.2f}])', ctx))
         else:
-            for feature_name, default_value in default_context.items():
-                if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
-                    continue
-                ctx_low = default_context.copy()
-                ctx_low[feature_name] = default_value * 0.5
-                
-                ctx_high = default_context.copy()
-                ctx_high[feature_name] = default_value * 1.5
-                
-                ctx_random = default_context.copy()
-                random_mult = np.random.uniform(0.5, 1.5)
-                ctx_random[feature_name] = default_value * random_mult
-                
+            RUN_RANDOM = os.environ.get('RUN_RANDOM') == '1'
+            RUN_HIGH = os.environ.get('RUN_HIGH') == '1'
+            RUN_LOW = os.environ.get('RUN_LOW') == '1'
+            RUN_NORMAL = os.environ.get('RUN_NORMAL') == '1'
+            if not (RUN_RANDOM or RUN_HIGH or RUN_LOW or RUN_NORMAL):
+                RUN_RANDOM = RUN_HIGH = RUN_LOW = RUN_NORMAL = True
+
+            if RUN_NORMAL:
+                eval_scenarios.append(("Baseline / Normal (1.0x)", default_context.copy()))
+
+            if BIGPICTURE:
+                all_low = default_context.copy()
+                all_high = default_context.copy()
+                all_random = default_context.copy()
+                for feature_name, default_value in default_context.items():
+                    if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
+                        continue
+                    all_low[feature_name] = default_value * 0.5
+                    all_high[feature_name] = default_value * 1.5
+                    # Random multiplier between 0.5 and 1.5
+                    all_random[feature_name] = default_value * np.random.uniform(0.5, 1.5)
                 if RUN_RANDOM:
-                    eval_scenarios.append((f"{feature_name} = {ctx_random[feature_name]:.4f} (Random {random_mult:.2f}x)", ctx_random))
+                    eval_scenarios.append(("All Params Random (0.5x - 1.5x)", all_random))
                 if RUN_LOW:
-                    eval_scenarios.append((f"{feature_name} = {ctx_low[feature_name]:.4f} (Low)", ctx_low))
+                    eval_scenarios.append(("All Params Low (-50%)", all_low))
                 if RUN_HIGH:
-                    eval_scenarios.append((f"{feature_name} = {ctx_high[feature_name]:.4f} (High)", ctx_high))
-                
+                    eval_scenarios.append(("All Params High (+50%)", all_high))
+            else:
+                for feature_name, default_value in default_context.items():
+                    if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
+                        continue
+                    ctx_low = default_context.copy()
+                    ctx_low[feature_name] = default_value * 0.5
+
+                    ctx_high = default_context.copy()
+                    ctx_high[feature_name] = default_value * 1.5
+
+                    ctx_random = default_context.copy()
+                    random_mult = np.random.uniform(0.5, 1.5)
+                    ctx_random[feature_name] = default_value * random_mult
+
+                    if RUN_RANDOM:
+                        eval_scenarios.append((f"{feature_name} = {ctx_random[feature_name]:.4f} (Random {random_mult:.2f}x)", ctx_random))
+                    if RUN_LOW:
+                        eval_scenarios.append((f"{feature_name} = {ctx_low[feature_name]:.4f} (Low)", ctx_low))
+                    if RUN_HIGH:
+                        eval_scenarios.append((f"{feature_name} = {ctx_high[feature_name]:.4f} (High)", ctx_high))
+
         for mod_label, ctx_dict in eval_scenarios:
             print(colored(f'Evaluating {mod_label}', 'cyan'))
             contexts = {0: ctx_dict}
@@ -276,8 +303,16 @@ def evaluate_carl(cfg: dict):
                 
                 ep_rewards.append(ep_reward)
                 ep_successes.append(info.get('success', 0.0))
-            
-            print(colored(f'  Result -> R: {np.mean(ep_rewards):.01f} | S: {np.mean(ep_successes):.02f}', 'green'))
+
+            mean_reward = np.mean(ep_rewards)
+            mean_success = np.mean(ep_successes)
+            if sweep_values is not None:
+                if baseline_reward is None:
+                    baseline_reward = mean_reward
+                retention = mean_reward / baseline_reward if baseline_reward != 0 else float('nan')
+                print(colored(f'  Result -> R: {mean_reward:.01f} | S: {mean_success:.02f} | Retention: {retention:.02f}', 'green'))
+            else:
+                print(colored(f'  Result -> R: {mean_reward:.01f} | S: {mean_success:.02f}', 'green'))
 
 import sys
 if __name__ == '__main__':
@@ -304,6 +339,11 @@ if __name__ == '__main__':
     if '--eval_tasks' in sys.argv:
         idx = sys.argv.index('--eval_tasks')
         os.environ['EVAL_TASKS'] = sys.argv[idx + 1]
+        sys.argv.pop(idx)
+        sys.argv.pop(idx)
+    if '--sweep' in sys.argv:
+        idx = sys.argv.index('--sweep')
+        os.environ['SWEEP_SCALES'] = sys.argv[idx + 1]
         sys.argv.pop(idx)
         sys.argv.pop(idx)
     evaluate_carl()
