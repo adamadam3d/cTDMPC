@@ -57,6 +57,12 @@ echo "  daemon ping: $(echo get_default_active_thread_percentage | nvidia-cuda-m
 # client inside singularity can find the server the host daemon spawned.
 export SINGULARITYENV_CUDA_MPS_PIPE_DIRECTORY=$CUDA_MPS_PIPE_DIRECTORY
 export SINGULARITYENV_CUDA_MPS_LOG_DIRECTORY=$CUDA_MPS_LOG_DIRECTORY
+# CRITICAL: the daemon started under CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES
+# (the SLURM-allocated physical GPU), so the MPS server re-indexes that single
+# GPU to local id 0. The client must ask MPS for id 0, NOT the physical id --
+# inheriting CUDA_VISIBLE_DEVICES=3 makes it request device 3, which is not in
+# MPS's 1-device visible set ("Invalid CUDA_VISIBLE_DEVICES" in server.log).
+export SINGULARITYENV_CUDA_VISIBLE_DEVICES=0
 singularity exec \
     -B /mnt/beegfs/ \
     -B "$CUDA_MPS_PIPE_DIRECTORY" \
