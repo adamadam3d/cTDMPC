@@ -10,7 +10,7 @@
 #SBATCH --cpus-per-task=28
 #SBATCH --gres=gpu:1
 #SBATCH -D /mnt/beegfs/data/AI-REEFSHIELD/tdm/cTDMPC/tdmpc2/
-#SBATCH --array=15-19
+#SBATCH --array=16-19
 
 # SPEED IMPROVEMENT variant of eval_taskid4_supervised_50k.sh.
 #
