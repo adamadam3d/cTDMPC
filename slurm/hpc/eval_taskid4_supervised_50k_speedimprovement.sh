@@ -81,18 +81,19 @@ export SINGULARITYENV_WANDB_API_KEY=$WANDB_API_KEY
 # Cap the workers per process; the launch stagger below does the rest.
 export SINGULARITYENV_TORCHINDUCTOR_COMPILE_THREADS=2
 
-# CUDA MPS is ON by default in this speed variant: it lets the PROCS_PER_GPU
-# processes' kernels run concurrently on the GPU instead of time-slicing it.
-# Worth it here because the workload is launch-bound (system.gpu.*.gpu ~100%
-# but system.gpu.*.memory in the single digits) -- MPS cannot help a workload
-# that is already compute-bound. Disable with:
-#   sbatch --export=ALL,USE_MPS=0 slurm/hpc/eval_taskid4_supervised_50k_speedimprovement.sh
-# The control daemon runs on the host (outside the container); its pipe/log
-# directories are bind-mounted and exported into the container so the client
-# processes inside singularity can find it. One daemon per array task (i.e.
-# per GPU, since --gres=gpu:1), torn down in a trap so it always quits even
-# if the eval loop below fails partway through.
-if [ "${USE_MPS:-1}" = "1" ]; then
+# CUDA MPS is OFF by default: in this SLURM + `singularity --nv` setup the MPS
+# server cannot attach to the cgroup-restricted GPU, so the client's CUDA init
+# fails and `torch.cuda.is_available()` returns False (every shard dies at the
+# assert in evaluate_checkpoints.py). The node is ~90% idle without MPS anyway,
+# so packing more procs is the real speedup, not concurrent kernels. Only turn
+# MPS on if you have verified it initializes CUDA correctly here:
+#   sbatch --export=ALL,USE_MPS=1 slurm/hpc/eval_taskid4_supervised_50k_speedimprovement.sh
+# When enabled: the control daemon runs on the host (outside the container);
+# its pipe/log directories are bind-mounted and exported into the container so
+# the client processes inside singularity can find it. One daemon per array
+# task (i.e. per GPU, since --gres=gpu:1), torn down in a trap so it always
+# quits even if the eval loop below fails partway through.
+if [ "${USE_MPS:-0}" = "1" ]; then
     export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}/pipe
     export CUDA_MPS_LOG_DIRECTORY=/tmp/mps_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}/log
     mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
