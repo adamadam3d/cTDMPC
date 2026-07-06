@@ -50,7 +50,7 @@ def randomize_physics(physics, rng, low=0.5, high=1.5, verbose=True):
             return
         arr[:] *= rng.uniform(lo, hi, size=arr.shape)
         if verbose:
-            print(colored(f'    randomized {field:<18} shape={tuple(arr.shape)}', 'grey'))
+            print(colored(f'    randomized {field:<18} shape={tuple(arr.shape)}', 'cyan'))
 
     with physics.reset_context():  # recompute derived quantities after editing the model
         # --- Global simulation options ---
@@ -178,15 +178,38 @@ def evaluate(cfg: dict):
             print(colored(f'  {task:<22}\tSkipped: {e}', 'red'))
             continue
 
+        # Multi-task models expect observations/actions padded to the global (max)
+        # dimensions used during training; single-task envs emit smaller vectors.
+        is_mt = bool(cfg.multitask)
+        expected_obs_dim = max(cfg.obs_shapes) if is_mt else None
+        env_action_dim = env.action_space.shape[0]
+
+        def pad_obs(o):
+            if not is_mt or o.shape[0] == expected_obs_dim:
+                return o
+            if o.shape[0] < expected_obs_dim:
+                pad = torch.zeros(expected_obs_dim - o.shape[0], dtype=o.dtype, device=o.device)
+                return torch.cat((o, pad))
+            return o[:expected_obs_dim]
+
+        def fit_action(a):
+            if a.shape[0] == env_action_dim:
+                return a
+            if a.shape[0] < env_action_dim:
+                pad = torch.zeros(env_action_dim - a.shape[0], dtype=a.dtype, device=a.device)
+                return torch.cat((a, pad))
+            return a[:env_action_dim]
+
         ep_rewards, ep_successes = [], []
         for i in range(cfg.eval_episodes):
-            obs, done, ep_reward, t = env.reset(), False, 0, 0
+            obs, done, ep_reward, t = pad_obs(env.reset()), False, 0, 0
             if cfg.save_video:
                 frames = [env.render()]
             while not done:
                 action = agent.act(obs, t0=t == 0, task=task_idx)
                 prev_obs = obs
-                obs, reward, done, info = env.step(action)
+                obs, reward, done, info = env.step(fit_action(action))
+                obs = pad_obs(obs)
                 if cfg.multitask:
                     agent.update_context(prev_obs, action, reward, obs)
                 ep_reward += reward
