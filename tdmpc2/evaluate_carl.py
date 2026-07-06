@@ -343,7 +343,16 @@ if __name__ == '__main__':
         sys.argv.pop(idx)
     if '--sweep' in sys.argv:
         idx = sys.argv.index('--sweep')
-        os.environ['SWEEP_SCALES'] = sys.argv[idx + 1]
+        sweep_arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ''
+        if not sweep_arg or '=' in sweep_arg:
+            print("Error: --sweep requires a comma-separated list of magnitudes, e.g. --sweep 0.1,0.2,0.3,0.4,0.5")
+            sys.exit(1)
+        try:
+            [float(x) for x in sweep_arg.split(',')]
+        except ValueError:
+            print(f"Error: --sweep values must be numbers, got: {sweep_arg!r}")
+            sys.exit(1)
+        os.environ['SWEEP_SCALES'] = sweep_arg
         sys.argv.pop(idx)
         sys.argv.pop(idx)
     evaluate_carl()
