@@ -100,8 +100,35 @@ def make_carl_env(cfg, domain, task, contexts=None):
     env = CARL_TDMPC2_Wrapper(env, action_repeat=2)
     env = Timeout(env, max_episode_steps=500)
     env = TensorWrapper(env)
-    
+
     return env
+
+
+def compute_physical_smax(default_context, context_space, cap=0.95):
+    """
+    Largest symmetric magnitude s such that scaling EVERY numeric context feature by
+    [1-s, 1+s] simultaneously stays within CARL's own declared feasible bounds for
+    this domain/task (via context_space.get_lower_and_upper_bound). Features with an
+    infinite bound on a side don't constrain that side; features with a zero default
+    can't be constrained multiplicatively and are skipped. `cap` keeps the result
+    strictly inside the boundary (rather than exactly on it) to avoid degenerate
+    physics (e.g. exactly zero friction).
+    """
+    s_max = cap
+    for name, default_value in default_context.items():
+        if not isinstance(default_value, (int, float)) or 'timestep' in name.lower():
+            continue
+        if default_value == 0:
+            continue
+        try:
+            lo, hi = context_space.get_lower_and_upper_bound(name)
+        except Exception:
+            continue
+        if np.isfinite(lo):
+            s_max = min(s_max, 1.0 - lo / default_value)
+        if np.isfinite(hi):
+            s_max = min(s_max, hi / default_value - 1.0)
+    return max(s_max, 0.0)
 
 @hydra.main(config_name='config', config_path='.')
 def evaluate_carl(cfg: dict):
@@ -117,14 +144,29 @@ def evaluate_carl(cfg: dict):
     set_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
 
-    # --sweep s1,s2,... : magnitude sweep over ALL context params at once, scaled
-    # within [1-s, 1+s] per value of s (s=0 is always included as the unperturbed
-    # baseline). Produces a dose-response curve instead of fixed 0.5x/1.5x points.
+    # --sweep : magnitude sweep over ALL context params at once, scaled within
+    # [1-s, 1+s] per value of s (s=0 is always included as the unperturbed baseline).
+    # Two forms:
+    #   --sweep 0.1,0.2,0.3      explicit list of magnitudes
+    #   --sweep auto[:n_steps]   auto: sweep baseline -> the physically-extreme
+    #                            magnitude allowed by CARL's own declared context
+    #                            bounds for each task, in n_steps (default 5)
     SWEEP_SCALES = os.environ.get('SWEEP_SCALES')
-    sweep_values = sorted(set([0.0] + [float(x) for x in SWEEP_SCALES.split(',')])) if SWEEP_SCALES else None
-    if sweep_values is not None:
-        print(colored(f'Sweep mode enabled: magnitudes s={sweep_values} '
-                      f'(all context params scaled within [1-s, 1+s] simultaneously)', 'yellow', attrs=['bold']))
+    sweep_auto = False
+    sweep_n_steps = 5
+    sweep_values = None
+    if SWEEP_SCALES:
+        if SWEEP_SCALES.lower().split(':')[0] in ('auto', 'max', 'extreme'):
+            sweep_auto = True
+            if ':' in SWEEP_SCALES:
+                sweep_n_steps = int(SWEEP_SCALES.split(':', 1)[1])
+            print(colored(f'Sweep mode enabled (AUTO): {sweep_n_steps} steps from baseline (s=0) to the '
+                          f'physically-extreme magnitude allowed by CARL context bounds, per task.', 'yellow', attrs=['bold']))
+        else:
+            sweep_values = sorted(set([0.0] + [float(x) for x in SWEEP_SCALES.split(',')]))
+            print(colored(f'Sweep mode enabled: magnitudes s={sweep_values} '
+                          f'(all context params scaled within [1-s, 1+s] simultaneously)', 'yellow', attrs=['bold']))
+    sweep_enabled = sweep_auto or sweep_values is not None
 
     BIGPICTURE = os.environ.get('BIGPICTURE') == '1' or cfg.get('BIGPICTURE', False) or cfg.get('bigpicture', False)
 
@@ -184,11 +226,19 @@ def evaluate_carl(cfg: dict):
 
         eval_scenarios = []
 
-        if sweep_values is not None:
+        if sweep_enabled:
+            if sweep_auto:
+                context_space = carl_env_cls.get_context_space()
+                s_max = compute_physical_smax(default_context, context_space)
+                task_sweep_values = list(np.linspace(0.0, s_max, sweep_n_steps))
+                print(colored(f'  [auto] physically-extreme magnitude for {task_str}: s_max={s_max:.4f}', 'cyan'))
+            else:
+                task_sweep_values = sweep_values
+
             # Dose-response sweep: one scenario per magnitude s, all numeric context
             # params scaled simultaneously within [1-s, 1+s]. s=0 is the unperturbed
-            # baseline (always first, since sweep_values is sorted and includes 0.0).
-            for s in sweep_values:
+            # baseline (always first, since the values are sorted/ascending from 0).
+            for s in task_sweep_values:
                 if s == 0.0:
                     eval_scenarios.append((f'Sweep s=0.00 (Baseline)', default_context.copy()))
                     continue
@@ -306,7 +356,7 @@ def evaluate_carl(cfg: dict):
 
             mean_reward = np.mean(ep_rewards)
             mean_success = np.mean(ep_successes)
-            if sweep_values is not None:
+            if sweep_enabled:
                 if baseline_reward is None:
                     baseline_reward = mean_reward
                 retention = mean_reward / baseline_reward if baseline_reward != 0 else float('nan')
@@ -341,22 +391,35 @@ if __name__ == '__main__':
         os.environ['EVAL_TASKS'] = sys.argv[idx + 1]
         sys.argv.pop(idx)
         sys.argv.pop(idx)
-    DEFAULT_SWEEP = '0.1,0.2,0.3,0.4,0.5'
+    # --sweep [auto[:n_steps] | s1,s2,...]
+    # No value -> defaults to 'auto:5': sweep baseline (s=0) to the physically-extreme
+    # magnitude allowed by CARL's own declared context bounds, in 5 steps.
+    DEFAULT_SWEEP = 'auto:5'
     if '--sweep' in sys.argv:
         idx = sys.argv.index('--sweep')
         has_value = idx + 1 < len(sys.argv) and '=' not in sys.argv[idx + 1]
         if has_value:
             sweep_arg = sys.argv[idx + 1]
-            try:
-                [float(x) for x in sweep_arg.split(',')]
-            except ValueError:
-                print(f"Error: --sweep values must be numbers, got: {sweep_arg!r}")
-                sys.exit(1)
+            keyword = sweep_arg.lower().split(':')[0]
+            if keyword in ('auto', 'max', 'extreme'):
+                if ':' in sweep_arg:
+                    try:
+                        int(sweep_arg.split(':', 1)[1])
+                    except ValueError:
+                        print(f"Error: --sweep {keyword}:<n> requires an integer step count, got: {sweep_arg!r}")
+                        sys.exit(1)
+            else:
+                try:
+                    [float(x) for x in sweep_arg.split(',')]
+                except ValueError:
+                    print(f"Error: --sweep values must be numbers or 'auto[:n_steps]', got: {sweep_arg!r}")
+                    sys.exit(1)
             sys.argv.pop(idx)
             sys.argv.pop(idx)
         else:
             sweep_arg = DEFAULT_SWEEP
-            print(f"No value given for --sweep; defaulting to {DEFAULT_SWEEP}")
+            print(f"No value given for --sweep; defaulting to {DEFAULT_SWEEP} "
+                  f"(baseline -> physically-extreme CARL bound, 5 steps)")
             sys.argv.pop(idx)
         os.environ['SWEEP_SCALES'] = sweep_arg
     evaluate_carl()
