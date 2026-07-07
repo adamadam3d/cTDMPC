@@ -260,6 +260,39 @@ class TDMPC2(torch.nn.Module):
 			self._z_ctx.copy_(z.unsqueeze(0))
 
 	@torch.no_grad()
+	def context(self, task=None, eval_mode=False):
+		"""
+		Read the current inferred context z_ctx from online encoder state,
+		without resetting or mutating it. Pure accessor: only `_reset_context`
+		(called at t0) and `update_context` (called after a step) change this
+		state, so calling this right after `act` recovers the exact z_ctx that
+		was used to select the last action -- e.g. for model-prediction
+		diagnostics that need to replay the same conditioning outside of `act`.
+
+		Args:
+			task (torch.Tensor or int): Task index (only used by `task_id`).
+			eval_mode (bool): Whether to use the posterior mean (pearl) instead
+				of a reparameterised sample; must match what `act` was called
+				with, to recover the same z_ctx.
+
+		Returns:
+			torch.Tensor or None: z_ctx, or None in single-task mode.
+		"""
+		if not self.cfg.multitask:
+			return None
+		if task is not None and not torch.is_tensor(task):
+			task = torch.tensor([task], device=self.device)
+		if self.cfg.context_encoder == 'task_id':
+			return self.model.task_latent(task)
+		elif self.cfg.context_encoder == 'varibad':
+			return self._belief
+		elif self.cfg.context_encoder == 'supervised':
+			return self._z_ctx
+		elif eval_mode:
+			return self._z_ctx_mu
+		return self._z_ctx_mu + torch.randn_like(self._z_ctx_mu) * torch.exp(0.5*self._z_ctx_logvar)
+
+	@torch.no_grad()
 	def act(self, obs, t0=False, eval_mode=False, task=None):
 		"""
 		Select an action by planning in the latent space of the world model.
@@ -279,21 +312,9 @@ class TDMPC2(torch.nn.Module):
 		obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
 		if task is not None:
 			task = torch.tensor([task], device=self.device)
-		if self.cfg.multitask:
-			if t0:
-				self._reset_context()
-			if self.cfg.context_encoder == 'task_id':
-				z_ctx = self.model.task_latent(task)
-			elif self.cfg.context_encoder == 'varibad':
-				z_ctx = self._belief
-			elif self.cfg.context_encoder == 'supervised':
-				z_ctx = self._z_ctx
-			elif eval_mode:
-				z_ctx = self._z_ctx_mu
-			else:
-				z_ctx = self._z_ctx_mu + torch.randn_like(self._z_ctx_mu) * torch.exp(0.5*self._z_ctx_logvar)
-		else:
-			z_ctx = None
+		if self.cfg.multitask and t0:
+			self._reset_context()
+		z_ctx = self.context(task, eval_mode)
 		if self.cfg.mpc:
 			return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task, z_ctx=z_ctx).cpu()
 		z = self.model.encode(obs, z_ctx)

@@ -12,11 +12,13 @@ import hydra
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from termcolor import colored
 
 from common.parser import parse_cfg
 from common.seed import set_seed
 from common.logger import Logger
+from common import math as tdmath
 from tdmpc2 import TDMPC2
 
 # CARL imports
@@ -271,6 +273,21 @@ def evaluate_carl(cfg: dict):
                           f'(all context params scaled within [1-s, 1+s] simultaneously)', 'yellow', attrs=['bold']))
     sweep_enabled = sweep_auto or sweep_values is not None
 
+    # --probe : RQ1 context-recovery dataset. Replaces scenario evaluation entirely:
+    # for each task, roll out N episodes on the FINAL checkpoint, each under a fresh
+    # context with every numeric feature perturbed independently within the task's
+    # physically-feasible box, and dump one row per episode pairing the inferred
+    # z_ctx with the ground-truth context values (see probe_one_checkpoint).
+    PROBE_EPISODES = os.environ.get('PROBE_EPISODES')
+    probe_enabled = PROBE_EPISODES is not None
+    if probe_enabled:
+        assert getattr(cfg, 'multitask', False), \
+            '--probe requires a multitask context encoder (z_ctx is None in single-task mode).'
+        print(colored(f'Probe mode enabled: {PROBE_EPISODES} episodes per task, every context feature '
+                      f'perturbed independently; scenario evaluation is skipped.', 'yellow', attrs=['bold']))
+        if sweep_enabled:
+            print(colored('--sweep is ignored in probe mode.', 'red'))
+
     BIGPICTURE = os.environ.get('BIGPICTURE') == '1' or cfg.get('BIGPICTURE', False) or cfg.get('bigpicture', False)
     FULL_CARL = os.environ.get('FULL_CARL') == '1'
     QUADRUPED = os.environ.get('QUADRUPED') == '1'
@@ -325,28 +342,52 @@ def evaluate_carl(cfg: dict):
     if cfg.checkpoint != '???':
         fps = find_checkpoints(cfg.checkpoint)
         num_shards = cfg.get('num_shards', 1)
-        if num_shards > 1:
+        # Optionally thin the checkpoint list for a cheaper coarse-grid backfill
+        # (e.g. every-100k instead of every-50k). find_checkpoints sorts the
+        # trained model (final.pt, a non-numeric stem) LAST, so fps[-1] is always
+        # the fully-trained checkpoint; ALWAYS keep it -- it is the single most
+        # important eval point and is not a duplicate of any numeric checkpoint
+        # (offline_trainer's loop stops one step short of cfg.steps, so no
+        # {cfg.steps}.pt exists; final.pt is the only copy of the converged model).
+        ckpt_stride = int(cfg.get('ckpt_stride', 1))
+        if ckpt_stride > 1 and not probe_enabled and len(fps) > 1:
+            kept = fps[::ckpt_stride]
+            if fps[-1] not in kept:
+                kept.append(fps[-1])
+            print(colored(f'ckpt_stride={ckpt_stride}: evaluating {len(kept)}/{len(fps)} '
+                          f'checkpoints (final.pt always kept).', 'blue', attrs=['bold']))
+            fps = kept
+        if probe_enabled:
+            # Probe the FINAL checkpoint only: RQ1 needs the converged embedding,
+            # not the training trajectory. num_shards/checkpoint_shard split the
+            # per-task episode budget inside probe_one_checkpoint, not the
+            # checkpoint list; resume is tracked per (checkpoint, task) in
+            # context_probe_done_shard<i>.txt, not carl_evaluated.txt.
+            fps = fps[-1:]
+            print(colored(f'Probe mode: final checkpoint only ({fps[0]}).', 'blue', attrs=['bold']))
+        elif num_shards > 1:
             assert 0 <= shard < num_shards, f'checkpoint_shard must be in [0, {num_shards}), got {shard}.'
             # Stride over the full sorted list so concurrent shards are disjoint by
             # construction, regardless of which checkpoints are already evaluated.
             fps = fps[shard::num_shards]
             print(colored(f'Shard {shard}/{num_shards}: {len(fps)} checkpoint(s).', 'blue', attrs=['bold']))
-        print(colored(f'Found {len(fps)} checkpoint(s):', 'blue', attrs=['bold']))
-        for fp in fps:
-            print(colored(f'  {fp}', 'blue'))
-        # Skip checkpoints already evaluated by a previous invocation, so a crashed
-        # or extended sweep does not redo finished work.
-        done_fp = Path(cfg.work_dir) / 'carl_evaluated.txt'
-        done = set(done_fp.read_text().split()) if done_fp.exists() else set()
-        if done:
-            skipped = [fp for fp in fps if fp.stem in done]
-            if skipped:
-                print(colored(f'Skipping {len(skipped)} checkpoint(s) already evaluated '
-                              f'(delete {done_fp} to force re-evaluation).', 'yellow', attrs=['bold']))
-                fps = [fp for fp in fps if fp.stem not in done]
-        if not fps:
-            print(colored('All checkpoints have already been evaluated.', 'yellow', attrs=['bold']))
-            return
+        if not probe_enabled:
+            print(colored(f'Found {len(fps)} checkpoint(s):', 'blue', attrs=['bold']))
+            for fp in fps:
+                print(colored(f'  {fp}', 'blue'))
+            # Skip checkpoints already evaluated by a previous invocation, so a crashed
+            # or extended sweep does not redo finished work.
+            done_fp = Path(cfg.work_dir) / 'carl_evaluated.txt'
+            done = set(done_fp.read_text().split()) if done_fp.exists() else set()
+            if done:
+                skipped = [fp for fp in fps if fp.stem in done]
+                if skipped:
+                    print(colored(f'Skipping {len(skipped)} checkpoint(s) already evaluated '
+                                  f'(delete {done_fp} to force re-evaluation).', 'yellow', attrs=['bold']))
+                    fps = [fp for fp in fps if fp.stem not in done]
+            if not fps:
+                print(colored('All checkpoints have already been evaluated.', 'yellow', attrs=['bold']))
+                return
     else:
         print(colored('Warning: No checkpoint provided. Evaluating untrained agent.', 'red', attrs=['bold']))
         fps = [None]
@@ -367,6 +408,11 @@ def evaluate_carl(cfg: dict):
         # confounded by different random contexts per checkpoint.
         set_seed(cfg.seed)
         rng = np.random.default_rng(cfg.seed)
+
+        if probe_enabled:
+            probe_one_checkpoint(cfg, agent, step, target_tasks, shard,
+                                 cfg.get('num_shards', 1), int(PROBE_EPISODES))
+            continue
 
         metrics = {'iteration': step}
         baseline_scores = []  # evaluate.py-style normalized score, from each task's unperturbed baseline
@@ -534,6 +580,7 @@ def eval_one_checkpoint(cfg, agent, logger, target_tasks, sweep_enabled, sweep_a
 
                 try:
                     ep_rewards, ep_successes = [], []
+                    ep_consistency_errs, ep_reward_errs = [], []
                     for i in range(cfg.eval_episodes):
                         obs, done, ep_reward, t = env.reset(), False, 0, 0
                         while not done:
@@ -572,6 +619,27 @@ def eval_one_checkpoint(cfg, agent, logger, target_tasks, sweep_enabled, sweep_a
                                     next_padded_obs = obs[:expected_obs_dim]
                                 else:
                                     next_padded_obs = obs
+
+                                # Model-prediction diagnostics on this real transition,
+                                # under z_ctx_t -- the context that was actually used to
+                                # select `action` (recovered via agent.context, called
+                                # before update_context mutates the online context state
+                                # below). Mirrors the training-time consistency/reward
+                                # losses (Eq. loss-model): does the world model, given the
+                                # inferred context, predict the real next latent state and
+                                # reward, on a context possibly unseen during training?
+                                with torch.no_grad():
+                                    z_ctx_t = agent.context(task_idx, eval_mode=False)
+                                    obs_t = prev_obs.unsqueeze(0).to(agent.device)
+                                    act_t = action.unsqueeze(0).to(agent.device)
+                                    next_obs_t = next_padded_obs.unsqueeze(0).to(agent.device)
+                                    z_t = agent.model.encode(obs_t, z_ctx_t)
+                                    z_pred = agent.model.next(z_t, act_t, z_ctx_t)
+                                    r_pred = tdmath.two_hot_inv(agent.model.reward(z_t, act_t, z_ctx_t), cfg)
+                                    z_true = agent.model.encode(next_obs_t, z_ctx_t)
+                                    ep_consistency_errs.append(F.mse_loss(z_pred, z_true).item())
+                                    ep_reward_errs.append((r_pred.item() - reward) ** 2)
+
                                 agent.update_context(prev_obs, action, reward, next_padded_obs)
 
                             ep_reward += reward
@@ -593,6 +661,10 @@ def eval_one_checkpoint(cfg, agent, logger, target_tasks, sweep_enabled, sweep_a
 
             mean_reward = np.mean(ep_rewards)
             mean_success = np.mean(ep_successes)
+            # NaN (not 0) when empty: single-task mode never populates these, and
+            # a genuine "0 error" reading must stay distinguishable from "not measured".
+            mean_consistency_err = np.mean(ep_consistency_errs) if ep_consistency_errs else float('nan')
+            mean_reward_err = np.mean(ep_reward_errs) if ep_reward_errs else float('nan')
 
             if is_baseline and getattr(cfg, 'multitask', False):
                 # Same normalization convention as evaluate.py's multitask score.
@@ -614,11 +686,175 @@ def eval_one_checkpoint(cfg, agent, logger, target_tasks, sweep_enabled, sweep_a
             if is_baseline:
                 metrics[f'episode_reward+{task_str}'] = mean_reward
                 metrics[f'episode_success+{task_str}'] = mean_success
+                metrics[f'consistency_error+{task_str}'] = mean_consistency_err
+                metrics[f'reward_error+{task_str}'] = mean_reward_err
             else:
                 metrics[f'episode_reward+{task_str}+scn{scn_idx}'] = mean_reward
                 metrics[f'episode_success+{task_str}+scn{scn_idx}'] = mean_success
+                metrics[f'consistency_error+{task_str}+scn{scn_idx}'] = mean_consistency_err
+                metrics[f'reward_error+{task_str}+scn{scn_idx}'] = mean_reward_err
                 if sweep_enabled:
                     metrics[f'retention+{task_str}+scn{scn_idx}'] = retention
+
+
+# Context-recovery probe (--probe): z_ctx snapshot times within an episode. The
+# online context window (cfg.context_window=100) is full from t=100 on, so the
+# t<100 snapshots capture the identification transient and the tail mean is the
+# settled embedding. All steps within an episode share ONE ground-truth context,
+# so the probe's effective sample size is #episodes, not #steps -- hence one row
+# per episode with a few snapshots rather than per-step rows.
+PROBE_SNAP_STEPS = (25, 50, 100, 250)
+PROBE_TAIL_STEPS = 100
+
+
+def probe_rollout(cfg, agent, env, task_idx):
+    """
+    One full episode under the currently-loaded agent, collecting the inferred
+    context embedding after every step. Mirrors the scenario rollout in
+    eval_one_checkpoint (obs/action padding, model-prediction diagnostics) but
+    returns the per-step z_ctx history instead of accumulating wandb metrics.
+    PhysicsError propagates to the caller, which resamples the context.
+    """
+    expected_obs_dim = max(cfg.obs_shapes)
+
+    def pad_obs(o):
+        if o.shape[0] < expected_obs_dim:
+            return torch.cat((o, torch.zeros(expected_obs_dim - o.shape[0], dtype=o.dtype, device=o.device)))
+        if o.shape[0] > expected_obs_dim:
+            return o[:expected_obs_dim]
+        return o
+
+    obs, done, ep_reward, t = env.reset(), False, 0, 0
+    z_hist, cons_errs, rew_errs = [], [], []
+    while not done:
+        padded_obs = pad_obs(obs)
+        action = agent.act(padded_obs, t0=t == 0, task=task_idx)
+        prev_obs = padded_obs
+
+        env_action = action
+        if env_action.shape[0] < env.action_space.shape[0]:
+            padding = torch.zeros(env.action_space.shape[0] - env_action.shape[0], dtype=env_action.dtype, device=env_action.device)
+            env_action = torch.cat((env_action, padding))
+        elif env_action.shape[0] > env.action_space.shape[0]:
+            env_action = env_action[:env.action_space.shape[0]]
+
+        obs, reward, done, info = env.step(env_action)
+        next_padded_obs = pad_obs(obs)
+
+        with torch.no_grad():
+            # Same model-prediction diagnostics as eval_one_checkpoint, under the
+            # z_ctx that actually selected `action` (read before update_context).
+            z_ctx_t = agent.context(task_idx, eval_mode=False)
+            obs_t = prev_obs.unsqueeze(0).to(agent.device)
+            act_t = action.unsqueeze(0).to(agent.device)
+            next_obs_t = next_padded_obs.unsqueeze(0).to(agent.device)
+            z_t = agent.model.encode(obs_t, z_ctx_t)
+            z_pred = agent.model.next(z_t, act_t, z_ctx_t)
+            r_pred = tdmath.two_hot_inv(agent.model.reward(z_t, act_t, z_ctx_t), cfg)
+            z_true = agent.model.encode(next_obs_t, z_ctx_t)
+            cons_errs.append(F.mse_loss(z_pred, z_true).item())
+            rew_errs.append((r_pred.item() - reward) ** 2)
+
+        agent.update_context(prev_obs, action, reward, next_padded_obs)
+        with torch.no_grad():
+            # The embedding after t+1 observed transitions: the probe's regressor input.
+            z_hist.append(agent.context(task_idx, eval_mode=False).squeeze(0).float().cpu().numpy())
+
+        ep_reward += reward
+        t += 1
+
+    return ep_reward, info.get('success', 0.0), cons_errs, rew_errs, z_hist
+
+
+def probe_one_checkpoint(cfg, agent, step, target_tasks, shard, num_shards, n_episodes):
+    """
+    Dump the RQ1 context-recovery dataset for the currently-loaded checkpoint.
+    For each task, roll out this shard's slice of the n_episodes budget, each
+    episode under a fresh context with EVERY numeric feature perturbed
+    independently (mult ~ U(1-s_max, 1+s_max), s_max = the task's physically-
+    feasible bound via compute_physical_smax). Independent per-feature draws --
+    unlike the lockstep --sweep -- keep the probe's design matrix well-conditioned
+    so per-dimension R^2 is attributable to that dimension.
+
+    One row per episode: ground-truth context values (raw, unnormalized) +
+    z_ctx snapshots at PROBE_SNAP_STEPS and the last-PROBE_TAIL_STEPS mean,
+    appended to a per-task, per-shard CSV (per-task because context features
+    differ across domains; a shared CSV would misalign columns on append).
+
+    For task_id checkpoints the z columns are constant per task by construction:
+    that is the negative control -- probe R^2 ~ 0 expected.
+    """
+    done_fp = Path(cfg.work_dir) / f'context_probe_done_shard{shard}.txt'
+    done = set(done_fp.read_text().splitlines()) if done_fp.exists() else set()
+    ep_ids = list(range(shard, n_episodes, num_shards))
+    for task_str in target_tasks:
+        done_key = f'{step}:{task_str}'
+        if done_key in done:
+            print(colored(f'Probe: skipping {task_str} (already done, see {done_fp}).', 'yellow'))
+            continue
+        domain, task = task_str.replace('-', '_').split('_', 1)
+        domain = dict(cup='ball_in_cup', pointmass='point_mass').get(domain, domain)
+        task_idx = cfg.tasks.index(task_str) if task_str in cfg.tasks else int(np.argmax(cfg.action_dims))
+
+        carl_env_cls = CARL_ENV_MAP[domain]
+        temp_env = carl_env_cls(task=task)
+        default_context = temp_env.get_default_context()
+        context_space = carl_env_cls.get_context_space()
+        s_max = compute_physical_smax(default_context, context_space)
+        # Deterministic per (seed, shard, task) stream: shards draw disjoint
+        # context sequences, and a resubmission redraws the same ones.
+        rng = np.random.default_rng([cfg.seed, shard, target_tasks.index(task_str)])
+        print(colored(f'\n--- Probe task: {task_str} ({len(ep_ids)} episodes, s_max={s_max:.4f}) ---',
+                      'magenta', attrs=['bold']))
+
+        rows = []
+        for ep_id in ep_ids:
+            result, last_err = None, None
+            for _attempt in range(MAX_RETRY_ATTEMPTS):
+                ctx = build_perturbed_context(default_context, s_max, rng, context_space)
+                try:
+                    env = make_carl_env(cfg, domain, task, contexts={0: ctx})
+                except ValueError as e:
+                    last_err = e
+                    continue
+                try:
+                    result = probe_rollout(cfg, agent, env, task_idx)
+                    break
+                except PhysicsError as e:
+                    last_err = e
+                    continue
+            if result is None:
+                print(colored(f'  Episode {ep_id}: skipped after {MAX_RETRY_ATTEMPTS} resample attempts '
+                              f'(physics infeasible/unstable): {last_err}', 'red'))
+                continue
+            ep_reward, ep_success, cons_errs, rew_errs, z_hist = result
+            row = {'iteration': step, 'task': task_str, 'episode': ep_id, 's_max': s_max,
+                   'episode_reward': float(ep_reward), 'episode_success': float(ep_success),
+                   'consistency_error': float(np.mean(cons_errs)) if cons_errs else float('nan'),
+                   'reward_error': float(np.mean(rew_errs)) if rew_errs else float('nan')}
+            for name, value in ctx.items():
+                if isinstance(value, (int, float)):
+                    row[f'ctx_{name}'] = value
+            z_dim = len(z_hist[0])
+            for snap_t in PROBE_SNAP_STEPS:
+                z = z_hist[snap_t - 1] if len(z_hist) >= snap_t else [float('nan')] * z_dim
+                for i in range(z_dim):
+                    row[f'z_t{snap_t}_{i}'] = z[i]
+            z_tail = np.mean(z_hist[-PROBE_TAIL_STEPS:], axis=0)
+            for i in range(z_dim):
+                row[f'z_tail_{i}'] = z_tail[i]
+            rows.append(row)
+            print(colored(f'  Episode {ep_id}: R: {float(ep_reward):.01f} | S: {float(ep_success):.02f}', 'green'))
+
+        # Buffer the whole task slice and append once: a crash mid-task leaves no
+        # partial rows behind, so the all-or-nothing resume marker stays accurate.
+        csv_fp = Path(cfg.work_dir) / f'context_probe_{task_str}_shard{shard}.csv'
+        if rows:
+            pd.DataFrame(rows).to_csv(csv_fp, mode='a', header=not csv_fp.exists(), index=False)
+        with open(done_fp, 'a') as f:
+            f.write(f'{done_key}\n')
+        print(colored(f'  Wrote {len(rows)} rows -> {csv_fp}', 'blue'))
+
 
 import sys
 if __name__ == '__main__':
@@ -653,6 +889,24 @@ if __name__ == '__main__':
         os.environ['EVAL_TASKS'] = sys.argv[idx + 1]
         sys.argv.pop(idx)
         sys.argv.pop(idx)
+    # --probe [N] : context-recovery probe (RQ1), N episodes per task (default 200).
+    # Replaces scenario evaluation; see probe_one_checkpoint.
+    if '--probe' in sys.argv:
+        idx = sys.argv.index('--probe')
+        nxt = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ''
+        has_value = nxt != '' and '=' not in nxt and not nxt.startswith('-')
+        if has_value:
+            try:
+                int(nxt)
+            except ValueError:
+                print(f"Error: --probe requires an integer episode count, got: {nxt!r}")
+                sys.exit(1)
+            os.environ['PROBE_EPISODES'] = nxt
+            sys.argv.pop(idx)
+            sys.argv.pop(idx)
+        else:
+            os.environ['PROBE_EPISODES'] = '200'
+            sys.argv.pop(idx)
     # --sweep [auto[:n_steps] | s1,s2,...]
     # No value -> defaults to 'auto:5': sweep baseline (s=0) to the physically-extreme
     # magnitude allowed by CARL's own declared context bounds, in 5 steps.

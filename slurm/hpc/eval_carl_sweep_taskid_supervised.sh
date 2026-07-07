@@ -52,13 +52,16 @@
 CARL_PYTHONPATH=/mnt/beegfs/data/AI-REEFSHIELD/tdm/pip_extras
 
 # One entry per combo: "<context_encoder> <seed> <wandb_project>"
+# Alternated (supervised, task_id) per seed rather than grouped by encoder, so
+# array tasks for both encoders get scheduled/land interleaved instead of all
+# of one encoder finishing before the other starts.
 COMBOS=(
-    "task_id    3 taskid_generalizable"
-    "task_id    4 taskid_generalizable"
-    "task_id    5 taskid_generalizable"
     "supervised 3 supervised_generalizable"
+    "task_id    3 taskid_generalizable"
     "supervised 4 supervised_generalizable"
+    "task_id    4 taskid_generalizable"
     "supervised 5 supervised_generalizable"
+    "task_id    5 taskid_generalizable"
 )
 GPUS_PER_COMBO=4
 # Overridable, e.g. to push further if CPULoad is still well under the alloc'd
@@ -67,19 +70,57 @@ GPUS_PER_COMBO=4
 #          slurm/hpc/eval_carl_sweep_taskid_supervised.sh
 PROCS_PER_GPU=${PROCS_PER_GPU:-8}
 
+# Backfill speed levers, ON BY DEFAULT (~6-7x cheaper than the original run).
+# Planning dominates eval cost, and the new error columns are per-step averages
+# that converge with far fewer episodes than returns do:
+#   EVAL_EPISODES=3  (default) -> ~3.3x faster; error estimates stay solid
+#                       (~1500 step samples/scenario), but this run's OWN
+#                       returns are noisier -- run 1's returns stay the source
+#                       of truth, this run contributes the error columns.
+#   CKPT_STRIDE=2    (default) -> every other checkpoint (~2x). evaluate_carl.py
+#                       ALWAYS keeps final.pt (the fully-trained model, saved
+#                       only at the very end and NOT duplicated by any numeric
+#                       checkpoint), so this thins the curve without ever
+#                       dropping the most important eval point.
+# Restore the original full budget (e.g. for a from-scratch replacement run):
+#   sbatch --export=ALL,EVAL_EPISODES=10,CKPT_STRIDE=1 \
+#          slurm/hpc/eval_carl_sweep_taskid_supervised.sh
+EVAL_EPISODES=${EVAL_EPISODES:-3}
+CKPT_STRIDE=${CKPT_STRIDE:-2}
+
+# Backfill re-run support: to re-evaluate with the new consistency_error/
+# reward_error columns WITHOUT touching the original run's wandb data or local
+# carl_evaluated.txt/CSVs (i.e. without the destructive "clear both, then
+# resubmit" dance), this defaults to tagging every combo's project as
+# "<tag>_<project>" (e.g. "secondrun_supervised_generalizable"), the wandb run
+# name as "<tag>-<encoder>-seed<seed>", and the local exp_name/work_dir as
+# "<tag>_carl_..." -- a fully independent eval directory (own
+# carl_evaluated.txt/CSVs) alongside the original. Override or clear it to
+# change the tag or backfill in place (original TODO.md workflow):
+#   sbatch --export=ALL,RERUN_TAG= slurm/hpc/eval_carl_sweep_taskid_supervised.sh
+RERUN_TAG=${RERUN_TAG-secondrun}
+
 COMBO=(${COMBOS[$(( SLURM_ARRAY_TASK_ID / GPUS_PER_COMBO ))]})
 ENC=${COMBO[0]}
 SEED=${COMBO[1]}
 PROJ=${COMBO[2]}
+WANDB_PROJ=$PROJ
+WANDB_NAME_PREFIX=""
+EXP_PREFIX=""
+if [ -n "$RERUN_TAG" ]; then
+    WANDB_PROJ=${RERUN_TAG}_${PROJ}
+    WANDB_NAME_PREFIX=${RERUN_TAG}-
+    EXP_PREFIX=${RERUN_TAG}_
+fi
 GPU_IDX=$(( SLURM_ARRAY_TASK_ID % GPUS_PER_COMBO ))
 NUM_SHARDS=$(( GPUS_PER_COMBO * PROCS_PER_GPU ))
 
 TRAIN_EXP=seed${SEED}_${ENC}_param5
 CKPT_DIR=/mnt/beegfs/data/AI-REEFSHIELD/tdm/cTDMPC/tdmpc2/logs/mt30/${SEED}/${TRAIN_EXP}/models
-EVAL_EXP=carl_${PROJ}_${TRAIN_EXP}
+EVAL_EXP=${EXP_PREFIX}carl_${PROJ}_${TRAIN_EXP}
 
-echo "Array task $SLURM_ARRAY_TASK_ID -> encoder=$ENC seed=$SEED project=$PROJ, shards $((GPU_IDX*PROCS_PER_GPU))-$((GPU_IDX*PROCS_PER_GPU+PROCS_PER_GPU-1)) of $NUM_SHARDS"
-echo "Checkpoints: $CKPT_DIR"
+echo "Array task $SLURM_ARRAY_TASK_ID -> encoder=$ENC seed=$SEED project=$WANDB_PROJ, shards $((GPU_IDX*PROCS_PER_GPU))-$((GPU_IDX*PROCS_PER_GPU+PROCS_PER_GPU-1)) of $NUM_SHARDS"
+echo "Checkpoints: $CKPT_DIR | ckpt_stride=$CKPT_STRIDE eval_episodes=$EVAL_EPISODES"
 
 # Grab the WandB API key from ~/.netrc using only the Python stdlib
 # (avoids the host's broken wandb/platformdirs install)
@@ -153,13 +194,15 @@ for (( p=0; p<PROCS_PER_GPU; p++ )); do
             "checkpoint=$CKPT_DIR" \
             "checkpoint_shard=$SHARD" \
             "num_shards=$NUM_SHARDS" \
-            eval_episodes=10 \
+            "ckpt_stride=$CKPT_STRIDE" \
+            "eval_episodes=$EVAL_EPISODES" \
             compile=true \
             cudagraphs=false \
             save_video=false \
             "exp_name=$EVAL_EXP" \
-            wandb_project=$PROJ \
+            wandb_project=$WANDB_PROJ \
             wandb_entity=https-www-guc-edu-eg- \
+            "wandb_name_prefix=$WANDB_NAME_PREFIX" \
             "hydra.run.dir=logs/hydra/${EVAL_EXP}/shard${SHARD}" \
         > "eval_${EVAL_EXP}_shard${SHARD}.log" 2>&1 &
 done

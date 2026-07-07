@@ -10,6 +10,7 @@ episodic: false
 checkpoint: ???
 checkpoint_shard: 0  # evaluate_checkpoints.py / evaluate_carl.py: this process evaluates every num_shards-th checkpoint, starting at this index
 num_shards: 1        # evaluate_checkpoints.py / evaluate_carl.py: total number of parallel eval processes sharding the checkpoint list
+ckpt_stride: 1       # evaluate_carl.py: thin the checkpoint list by this stride for a coarser/cheaper backfill (final.pt always kept); 1 = every checkpoint
 eval_episodes: 10
 eval_freq: 150000
 save_freq: 50000
@@ -88,6 +89,7 @@ simnorm_dim: 8
 # logging
 wandb_project: ???
 wandb_entity: ???
+wandb_name_prefix: ""   # prepended to the wandb run name, e.g. "secondrun-" to distinguish a re-eval from the original
 wandb_silent: false
 enable_wandb: true
 save_csv: true
