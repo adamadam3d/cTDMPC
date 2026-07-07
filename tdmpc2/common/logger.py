@@ -149,6 +149,10 @@ class Logger:
 		return self._video
 
 	@property
+	def wandb(self):
+		return self._wandb
+
+	@property
 	def model_dir(self):
 		return self._model_dir
 

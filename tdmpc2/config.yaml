@@ -8,8 +8,8 @@ episodic: false
 
 # evaluation
 checkpoint: ???
-checkpoint_shard: 0  # evaluate_checkpoints.py only: this process evaluates every num_shards-th checkpoint, starting at this index
-num_shards: 1        # evaluate_checkpoints.py only: total number of parallel eval processes sharding the checkpoint list
+checkpoint_shard: 0  # evaluate_checkpoints.py / evaluate_carl.py: this process evaluates every num_shards-th checkpoint, starting at this index
+num_shards: 1        # evaluate_checkpoints.py / evaluate_carl.py: total number of parallel eval processes sharding the checkpoint list
 eval_episodes: 10
 eval_freq: 150000
 save_freq: 50000

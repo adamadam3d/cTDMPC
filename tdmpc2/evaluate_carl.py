@@ -1,15 +1,22 @@
 import os
 os.environ['MUJOCO_GL'] = os.getenv("MUJOCO_GL", 'egl')
+os.environ['LAZY_LEGACY_OP'] = '0'
+os.environ['TORCHDYNAMO_INLINE_INBUILT_NN_MODULES'] = "1"
 import warnings
 warnings.filterwarnings('ignore')
 
+from glob import glob
+from pathlib import Path
+
 import hydra
 import numpy as np
+import pandas as pd
 import torch
 from termcolor import colored
 
 from common.parser import parse_cfg
 from common.seed import set_seed
+from common.logger import Logger
 from tdmpc2 import TDMPC2
 
 # CARL imports
@@ -27,7 +34,7 @@ CARL_ENV_MAP = {
 # the mt30 subset (e.g. walker-arabesque). Quadruped is excluded here; it only runs
 # with -g. Only runs with -F.
 FULL_CARL_TASKS = [
-    'walker-stand', 'walker-walk', 'walker-run', 'walker-walk-backwards', 'walker-run-backwards',
+    'walker-walk', 'walker-run', 'walker-walk-backwards', 'walker-run-backwards',
     'walker-arabesque', 'walker-lie-down', 'walker-legs-up', 'walker-headstand', 'walker-flip', 'walker-backflip',
     'fish-upright', 'fish-swim', 'fish-obstacles',
     'finger-spin', 'finger-turn-easy', 'finger-turn-hard',
@@ -41,6 +48,9 @@ from envs.dmcontrol import suite
 from dm_control.rl.control import PhysicsError
 import gymnasium as gym
 import numpy as np
+
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision('high')
 
 class CARL_TDMPC2_Wrapper(gym.Wrapper):
     def __init__(self, env, action_repeat=2):
@@ -205,6 +215,25 @@ def build_perturbed_context(default_context, s, rng, context_space):
     return ctx
 
 
+def find_checkpoints(checkpoint):
+    """
+    Expand `checkpoint` into an ordered list of checkpoint files. Accepts a
+    single .pt file, a directory of checkpoints (e.g. the `models/` dir written
+    during training), or a glob pattern. Ordered by the training iteration in
+    the filename, with non-numeric names (e.g. `final.pt`) last. Mirrors
+    evaluate_checkpoints.py.
+    """
+    path = Path(checkpoint)
+    if path.is_file():
+        fps = [path]
+    elif path.is_dir():
+        fps = [Path(fp) for fp in glob(str(path / '*.pt'))]
+    else:
+        fps = [Path(fp) for fp in glob(str(checkpoint))]
+    assert len(fps) > 0, f'No checkpoints found at {checkpoint}'
+    return sorted(fps, key=lambda fp: (0, int(fp.stem), '') if fp.stem.isdigit() else (1, 0, fp.stem))
+
+
 @hydra.main(config_name='config', config_path='.')
 def evaluate_carl(cfg: dict):
     assert torch.cuda.is_available(), "CUDA required for TD-MPC2."
@@ -217,7 +246,6 @@ def evaluate_carl(cfg: dict):
         cfg.seed = int(eval_seed)
         
     set_seed(cfg.seed)
-    rng = np.random.default_rng(cfg.seed)
 
     # --sweep : magnitude sweep over ALL context params at once, scaled within
     # [1-s, 1+s] per value of s (s=0 is always included as the unperturbed baseline).
@@ -277,7 +305,7 @@ def evaluate_carl(cfg: dict):
     else:
         # Subset of mt30 for walker, fish, and finger
         target_tasks = [
-            'walker-stand', 'walker-walk', 'walker-run', 'walker-walk-backwards', 'walker-run-backwards',
+            'walker-walk', 'walker-run', 'walker-walk-backwards', 'walker-run-backwards',
             'fish-swim',
             'finger-spin', 'finger-turn-easy', 'finger-turn-hard',
         ]
@@ -287,16 +315,93 @@ def evaluate_carl(cfg: dict):
     # Load agent (using original make_env to properly initialize config for multitask, e.g., cfg.tasks)
     _ = make_original_env(cfg)
     agent = TDMPC2(cfg)
+
+    # Expand `checkpoint` (single .pt file, directory of checkpoints, or glob
+    # pattern) into an ordered list so a whole training run can be evaluated in
+    # one invocation, mirroring evaluate_checkpoints.py -- including sharding
+    # (`checkpoint_shard`/`num_shards`) and resume via carl_evaluated.txt.
+    done_fp = None
+    shard = cfg.get('checkpoint_shard', 0)
     if cfg.checkpoint != '???':
-        assert os.path.exists(cfg.checkpoint), f'Checkpoint {cfg.checkpoint} not found!'
-        agent.load(cfg.checkpoint)
-        print(colored(f'Loaded Checkpoint: {cfg.checkpoint}', 'blue', attrs=['bold']))
+        fps = find_checkpoints(cfg.checkpoint)
+        num_shards = cfg.get('num_shards', 1)
+        if num_shards > 1:
+            assert 0 <= shard < num_shards, f'checkpoint_shard must be in [0, {num_shards}), got {shard}.'
+            # Stride over the full sorted list so concurrent shards are disjoint by
+            # construction, regardless of which checkpoints are already evaluated.
+            fps = fps[shard::num_shards]
+            print(colored(f'Shard {shard}/{num_shards}: {len(fps)} checkpoint(s).', 'blue', attrs=['bold']))
+        print(colored(f'Found {len(fps)} checkpoint(s):', 'blue', attrs=['bold']))
+        for fp in fps:
+            print(colored(f'  {fp}', 'blue'))
+        # Skip checkpoints already evaluated by a previous invocation, so a crashed
+        # or extended sweep does not redo finished work.
+        done_fp = Path(cfg.work_dir) / 'carl_evaluated.txt'
+        done = set(done_fp.read_text().split()) if done_fp.exists() else set()
+        if done:
+            skipped = [fp for fp in fps if fp.stem in done]
+            if skipped:
+                print(colored(f'Skipping {len(skipped)} checkpoint(s) already evaluated '
+                              f'(delete {done_fp} to force re-evaluation).', 'yellow', attrs=['bold']))
+                fps = [fp for fp in fps if fp.stem not in done]
+        if not fps:
+            print(colored('All checkpoints have already been evaluated.', 'yellow', attrs=['bold']))
+            return
     else:
         print(colored('Warning: No checkpoint provided. Evaluating untrained agent.', 'red', attrs=['bold']))
+        fps = [None]
 
-    baseline_scores = []  # evaluate.py-style normalized score, from each task's unperturbed baseline
-    all_retentions = []   # retention (perturbed/baseline) from every non-baseline scenario, all tasks
+    logger = Logger(cfg)
+    csv_fp = Path(cfg.work_dir) / f'carl_metrics_shard{shard}.csv'
 
+    for ckpt_fp in fps:
+        step = 0
+        if ckpt_fp is not None:
+            step = agent.load(ckpt_fp) or 0
+            if not step and ckpt_fp.stem.isdigit():
+                step = int(ckpt_fp.stem)  # older checkpoints do not store their iteration
+            print(colored(f'\n===== Checkpoint {ckpt_fp} (iteration {step}) =====', 'blue', attrs=['bold']))
+
+        # Reseed per checkpoint so every checkpoint sees the exact same sequence of
+        # perturbation draws -- curves over iterations are then comparable, not
+        # confounded by different random contexts per checkpoint.
+        set_seed(cfg.seed)
+        rng = np.random.default_rng(cfg.seed)
+
+        metrics = {'iteration': step}
+        baseline_scores = []  # evaluate.py-style normalized score, from each task's unperturbed baseline
+        all_retentions = []   # retention (perturbed/baseline) from every non-baseline scenario, all tasks
+
+        eval_one_checkpoint(cfg, agent, logger, target_tasks, sweep_enabled, sweep_auto,
+                            sweep_n_steps, sweep_values, BIGPICTURE, rng, metrics,
+                            baseline_scores, all_retentions)
+
+        if baseline_scores:
+            metrics['baseline_normalized_score'] = np.mean(baseline_scores)
+            print(colored(f'\nBaseline Normalized Score (s=0 / unperturbed, mt30-style): {metrics["baseline_normalized_score"]:.02f}', 'yellow', attrs=['bold']))
+        if all_retentions:
+            metrics['overall_mean_retention'] = np.mean(all_retentions)
+            print(colored(f'Overall Mean Retention across perturbed scenarios (all tasks): {metrics["overall_mean_retention"]:.02f}', 'yellow', attrs=['bold']))
+        if logger.wandb:
+            # Same convention as evaluate_checkpoints.py: `iteration` is the x-axis,
+            # metrics are prefixed with the category by Logger.log.
+            logger.log(metrics, 'pretrain')
+        # Local, wandb-independent record of all metrics, one CSV per shard;
+        # append so resumed invocations keep earlier rows.
+        pd.DataFrame([metrics]).to_csv(csv_fp, mode='a', header=not csv_fp.exists(), index=False)
+        if done_fp is not None:
+            with open(done_fp, 'a') as f:
+                f.write(f'{ckpt_fp.stem}\n')
+
+    logger.finish()
+
+
+def eval_one_checkpoint(cfg, agent, logger, target_tasks, sweep_enabled, sweep_auto,
+                        sweep_n_steps, sweep_values, BIGPICTURE, rng, metrics,
+                        baseline_scores, all_retentions):
+    """Run the CARL evaluation of the currently-loaded agent over `target_tasks`,
+    accumulating per-scenario results into `metrics` (keyed for wandb/CSV) and the
+    `baseline_scores`/`all_retentions` aggregate lists."""
     for task_str in target_tasks:
         domain, task = task_str.replace('-', '_').split('_', 1)
         domain = dict(cup='ball_in_cup', pointmass='point_mass').get(domain, domain)
@@ -398,7 +503,7 @@ def evaluate_carl(cfg: dict):
                     if RUN_HIGH:
                         eval_scenarios.append((f"{feature_name} = {ctx_high[feature_name]:.4f} (High)", ctx_high, False))
 
-        for mod_label, ctx_dict_or_sampler, is_baseline in eval_scenarios:
+        for scn_idx, (mod_label, ctx_dict_or_sampler, is_baseline) in enumerate(eval_scenarios):
             print(colored(f'Evaluating {mod_label}', 'cyan'))
 
             # Retry the WHOLE attempt (context draw + env construction + full episode
@@ -499,10 +604,17 @@ def evaluate_carl(cfg: dict):
             else:
                 print(colored(f'  Result -> R: {mean_reward:.01f} | S: {mean_success:.02f}', 'green'))
 
-    if baseline_scores:
-        print(colored(f'\nBaseline Normalized Score (s=0 / unperturbed, mt30-style): {np.mean(baseline_scores):.02f}', 'yellow', attrs=['bold']))
-    if all_retentions:
-        print(colored(f'Overall Mean Retention across perturbed scenarios (all tasks): {np.mean(all_retentions):.02f}', 'yellow', attrs=['bold']))
+            # Accumulate into the per-checkpoint metrics dict; the baseline scenario
+            # keeps the bare task key (comparable to evaluate_checkpoints.py curves),
+            # perturbed scenarios are suffixed by their stable scenario index.
+            if is_baseline:
+                metrics[f'episode_reward+{task_str}'] = mean_reward
+                metrics[f'episode_success+{task_str}'] = mean_success
+            else:
+                metrics[f'episode_reward+{task_str}+scn{scn_idx}'] = mean_reward
+                metrics[f'episode_success+{task_str}+scn{scn_idx}'] = mean_success
+                if sweep_enabled:
+                    metrics[f'retention+{task_str}+scn{scn_idx}'] = retention
 
 import sys
 if __name__ == '__main__':
