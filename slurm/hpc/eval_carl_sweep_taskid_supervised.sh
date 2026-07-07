@@ -42,9 +42,11 @@
 #
 # DEPENDENCY: tdmpc2.sif does NOT ship the `carl` package. It is installed once
 # to the beegfs dir below and injected via PYTHONPATH. To (re)install:
-#   singularity exec --home /mnt/beegfs/data/AI-REEFSHIELD/tdm/cTDMPC/tdmpc2/ \
+#   singularity exec -B /mnt/beegfs/ \
+#       --home /mnt/beegfs/data/AI-REEFSHIELD/tdm/cTDMPC/tdmpc2/ \
 #       /mnt/beegfs/public/images/tdmpc2.sif \
 #       python -m pip install --no-deps --target=/mnt/beegfs/data/AI-REEFSHIELD/tdm/pip_extras carl-bench
+#   (the -B bind is required -- without it the --target path is read-only)
 # (--no-deps on purpose: the container's dm_control/gymnasium/mujoco pins must
 # not be upgraded; install any genuinely-missing dep the same way, one by one.)
 CARL_PYTHONPATH=/mnt/beegfs/data/AI-REEFSHIELD/tdm/pip_extras
