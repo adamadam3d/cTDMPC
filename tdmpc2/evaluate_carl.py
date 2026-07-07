@@ -24,14 +24,18 @@ CARL_ENV_MAP = {
 }
 
 # Every dm_control task CARL can wrap for these 4 domains, including the tasks beyond
-# the mt30 subset (e.g. walker-arabesque, quadruped-escape). Only runs with -F.
+# the mt30 subset (e.g. walker-arabesque). Quadruped is excluded here; it only runs
+# with -g. Only runs with -F.
 FULL_CARL_TASKS = [
     'walker-stand', 'walker-walk', 'walker-run', 'walker-walk-backwards', 'walker-run-backwards',
     'walker-arabesque', 'walker-lie-down', 'walker-legs-up', 'walker-headstand', 'walker-flip', 'walker-backflip',
     'fish-upright', 'fish-swim', 'fish-obstacles',
     'finger-spin', 'finger-turn-easy', 'finger-turn-hard',
-    'quadruped-walk', 'quadruped-run', 'quadruped-escape', 'quadruped-fetch',
 ]
+
+# Quadruped tasks. Excluded from the default and FULL (-F) task lists; only runs
+# with -g.
+QUADRUPED_TASKS = ['quadruped-walk', 'quadruped-run', 'quadruped-escape', 'quadruped-fetch']
 
 from envs.dmcontrol import suite
 from dm_control.rl.control import PhysicsError
@@ -241,19 +245,24 @@ def evaluate_carl(cfg: dict):
 
     BIGPICTURE = os.environ.get('BIGPICTURE') == '1' or cfg.get('BIGPICTURE', False) or cfg.get('bigpicture', False)
     FULL_CARL = os.environ.get('FULL_CARL') == '1'
+    QUADRUPED = os.environ.get('QUADRUPED') == '1'
 
     eval_tasks_override = os.environ.get('EVAL_TASKS')
     if eval_tasks_override:
         target_tasks = eval_tasks_override.split(',')
+    elif QUADRUPED:
+        target_tasks = QUADRUPED_TASKS
+        print(colored(f"QUADRUPED mode (-g) enabled: running {QUADRUPED_TASKS}", "yellow", attrs=['bold']))
     elif FULL_CARL:
         target_tasks = FULL_CARL_TASKS
         print(colored(f"FULL mode (-F) enabled: running all {len(FULL_CARL_TASKS)} CARL-wrappable "
-                      f"dm_control tasks across walker/fish/finger/quadruped (beyond the mt30 subset).",
+                      f"dm_control tasks across walker/fish/finger (beyond the mt30 subset). "
+                      f"Quadruped tasks are excluded; pass -g to run those instead.",
                       "yellow", attrs=['bold']))
     elif BIGPICTURE:
         target_tasks = ['walker-run', 'fish-swim', 'finger-spin']
         print(colored("BIGPICTURE mode (-B) enabled: running walker-run, fish-swim, finger-spin", "yellow", attrs=['bold']))
-        print(colored("Note: quadruped-walk is excluded from BIGPICTURE by default (pass --eval_tasks to include it).", "red"))
+        print(colored("Note: quadruped tasks are excluded by default (pass -g to run those instead).", "red"))
         print(colored("Note: cup-spin is omitted because the CARL benchmark library does not implement a context wrapper for the cup domain.", "red"))
     else:
         # Subset of mt30 for walker, fish, and finger
@@ -261,7 +270,6 @@ def evaluate_carl(cfg: dict):
             'walker-stand', 'walker-walk', 'walker-run', 'walker-walk-backwards', 'walker-run-backwards',
             'fish-swim',
             'finger-spin', 'finger-turn-easy', 'finger-turn-hard',
-            'quadruped-walk', 'quadruped-run'
         ]
     
     print(colored(f'Evaluating CARL modified environments for tasks: {target_tasks}', 'yellow', attrs=['bold']))
@@ -499,6 +507,9 @@ if __name__ == '__main__':
     if '-F' in sys.argv:
         os.environ['FULL_CARL'] = '1'
         sys.argv.remove('-F')
+    if '-g' in sys.argv:
+        os.environ['QUADRUPED'] = '1'
+        sys.argv.remove('-g')
     if '-n' in sys.argv:
         os.environ['RUN_NORMAL'] = '1'
         sys.argv.remove('-n')
