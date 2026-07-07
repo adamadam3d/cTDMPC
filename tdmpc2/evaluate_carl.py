@@ -254,11 +254,21 @@ def evaluate_carl(cfg: dict):
         target_tasks = QUADRUPED_TASKS
         print(colored(f"QUADRUPED mode (-g) enabled: running {QUADRUPED_TASKS}", "yellow", attrs=['bold']))
     elif FULL_CARL:
-        target_tasks = FULL_CARL_TASKS
-        print(colored(f"FULL mode (-F) enabled: running all {len(FULL_CARL_TASKS)} CARL-wrappable "
-                      f"dm_control tasks across walker/fish/finger (beyond the mt30 subset). "
-                      f"Quadruped tasks are excluded; pass -g to run those instead.",
-                      "yellow", attrs=['bold']))
+        if getattr(cfg, 'multitask', False):
+            # Restrict to tasks actually in this checkpoint's training set (e.g. mt30),
+            # excluding CARL-wrappable tasks the model never saw (walker-arabesque, etc.).
+            target_tasks = [t for t in FULL_CARL_TASKS if t in cfg.tasks]
+            excluded = [t for t in FULL_CARL_TASKS if t not in cfg.tasks]
+            print(colored(f"FULL mode (-F) enabled: running {len(target_tasks)} CARL-wrappable "
+                          f"dm_control tasks in {cfg.task}'s training set: {target_tasks}",
+                          "yellow", attrs=['bold']))
+            if excluded:
+                print(colored(f"  Excluded (not in {cfg.task}): {excluded}", "red"))
+        else:
+            target_tasks = FULL_CARL_TASKS
+            print(colored(f"FULL mode (-F) enabled: running all {len(FULL_CARL_TASKS)} CARL-wrappable "
+                          f"dm_control tasks across walker/fish/finger.", "yellow", attrs=['bold']))
+        print(colored("Quadruped tasks are excluded from -F; pass -g to run those instead.", "red"))
     elif BIGPICTURE:
         target_tasks = ['walker-run', 'fish-swim', 'finger-spin']
         print(colored("BIGPICTURE mode (-B) enabled: running walker-run, fish-swim, finger-spin", "yellow", attrs=['bold']))
