@@ -130,6 +130,66 @@ def compute_physical_smax(default_context, context_space, cap=0.95):
             s_max = min(s_max, hi / default_value - 1.0)
     return max(s_max, 0.0)
 
+
+# Reference magnitudes for context features whose default is 0.0, where multiplicative
+# scaling would be a no-op (0 * mult == 0 for any mult). Perturbation for these is
+# additive instead: value = default + reference_scale * (mult - 1.0), clipped to
+# CARL's declared bounds. Chosen as a physically plausible "typical" magnitude for
+# each quantity (water-like density/viscosity, moderate wind speed, a joint stiffness
+# comparable in scale to the default joint_damping of 1.0).
+REFERENCE_SCALES = {
+    'density': 1000.0,
+    'viscosity': 0.01,
+    'joint_stiffness': 1.0,
+    'wind_x': 5.0,
+    'wind_y': 5.0,
+    'wind_z': 5.0,
+}
+
+# Max attempts to resample a random context at a given magnitude before giving up on
+# a scenario due to CARL raising a physics-infeasibility error (e.g. finger geometry
+# where limb lengths can't jointly reach the spinner -- a joint constraint that isn't
+# captured by any single feature's own [lo, hi] bound).
+MAX_RETRY_ATTEMPTS = 15
+
+
+def perturb_value(name, default_value, mult, context_space):
+    """
+    Perturb a single context feature by `mult` (a multiplier around 1.0). Nonzero
+    defaults are scaled multiplicatively (value = default * mult). Zero defaults
+    (density, viscosity, joint_stiffness, wind_*) use an additive perturbation via
+    REFERENCE_SCALES instead, since 0 * mult is always 0; the result is clipped to
+    the feature's declared bounds.
+    """
+    if default_value != 0:
+        return default_value * mult
+    ref = REFERENCE_SCALES.get(name)
+    if ref is None:
+        return default_value
+    value = default_value + ref * (mult - 1.0)
+    try:
+        lo, hi = context_space.get_lower_and_upper_bound(name)
+        if np.isfinite(lo):
+            value = max(value, lo)
+        if np.isfinite(hi):
+            value = min(value, hi)
+    except Exception:
+        pass
+    return value
+
+
+def build_perturbed_context(default_context, s, rng, context_space):
+    """Sample a fresh context at sweep magnitude s: every numeric, non-timestep
+    feature perturbed independently via perturb_value with mult ~ U(1-s, 1+s)."""
+    ctx = default_context.copy()
+    for feature_name, default_value in default_context.items():
+        if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
+            continue
+        mult = rng.uniform(1.0 - s, 1.0 + s)
+        ctx[feature_name] = perturb_value(feature_name, default_value, mult, context_space)
+    return ctx
+
+
 @hydra.main(config_name='config', config_path='.')
 def evaluate_carl(cfg: dict):
     assert torch.cuda.is_available(), "CUDA required for TD-MPC2."
@@ -174,8 +234,9 @@ def evaluate_carl(cfg: dict):
     if eval_tasks_override:
         target_tasks = eval_tasks_override.split(',')
     elif BIGPICTURE:
-        target_tasks = ['walker-run', 'fish-swim', 'finger-spin', 'quadruped-walk']
-        print(colored("BIGPICTURE mode (-B) enabled: running walker-run, fish-swim, finger-spin, quadruped-walk", "yellow", attrs=['bold']))
+        target_tasks = ['walker-run', 'fish-swim', 'finger-spin']
+        print(colored("BIGPICTURE mode (-B) enabled: running walker-run, fish-swim, finger-spin", "yellow", attrs=['bold']))
+        print(colored("Note: quadruped-walk is excluded from BIGPICTURE by default (pass --eval_tasks to include it).", "red"))
         print(colored("Note: cup-spin is omitted because the CARL benchmark library does not implement a context wrapper for the cup domain.", "red"))
     else:
         # Subset of mt30 for walker, fish, and finger
@@ -197,6 +258,9 @@ def evaluate_carl(cfg: dict):
         print(colored(f'Loaded Checkpoint: {cfg.checkpoint}', 'blue', attrs=['bold']))
     else:
         print(colored('Warning: No checkpoint provided. Evaluating untrained agent.', 'red', attrs=['bold']))
+
+    baseline_scores = []  # evaluate.py-style normalized score, from each task's unperturbed baseline
+    all_retentions = []   # retention (perturbed/baseline) from every non-baseline scenario, all tasks
 
     for task_str in target_tasks:
         domain, task = task_str.replace('-', '_').split('_', 1)
@@ -222,13 +286,17 @@ def evaluate_carl(cfg: dict):
         temp_env = carl_env_cls(task=task)
         # Use default context from the CARL environment
         default_context = temp_env.get_default_context()
+        context_space = carl_env_cls.get_context_space()
         baseline_reward = None  # set on the first (s=0) scenario when sweeping
 
+        # Each entry: (label, ctx_or_sampler, is_baseline). ctx_or_sampler is either a
+        # static context dict, or (for randomized sweep scenarios) a zero-arg callable
+        # that draws a fresh random context each time it's called -- used to retry on
+        # physics-infeasible draws instead of giving up on the whole scenario.
         eval_scenarios = []
 
         if sweep_enabled:
             if sweep_auto:
-                context_space = carl_env_cls.get_context_space()
                 s_max = compute_physical_smax(default_context, context_space)
                 task_sweep_values = list(np.linspace(0.0, s_max, sweep_n_steps))
                 print(colored(f'  [auto] physically-extreme magnitude for {task_str}: s_max={s_max:.4f}', 'cyan'))
@@ -236,18 +304,16 @@ def evaluate_carl(cfg: dict):
                 task_sweep_values = sweep_values
 
             # Dose-response sweep: one scenario per magnitude s, all numeric context
-            # params scaled simultaneously within [1-s, 1+s]. s=0 is the unperturbed
-            # baseline (always first, since the values are sorted/ascending from 0).
+            # params perturbed simultaneously within [1-s, 1+s] (multiplicatively for
+            # nonzero defaults, additively via REFERENCE_SCALES for zero defaults --
+            # see perturb_value). s=0 is the unperturbed baseline (evaluated first).
             for s in task_sweep_values:
                 if s == 0.0:
-                    eval_scenarios.append((f'Sweep s=0.00 (Baseline)', default_context.copy()))
-                    continue
-                ctx = default_context.copy()
-                for feature_name, default_value in default_context.items():
-                    if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
-                        continue
-                    ctx[feature_name] = default_value * rng.uniform(1.0 - s, 1.0 + s)
-                eval_scenarios.append((f'Sweep s={s:.2f} (scale [{1-s:.2f}, {1+s:.2f}])', ctx))
+                    eval_scenarios.append((f'Sweep s=0.00 (Baseline)', default_context.copy(), True))
+                else:
+                    label = f'Sweep s={s:.2f} (scale [{1-s:.2f}, {1+s:.2f}])'
+                    sampler = (lambda s=s: build_perturbed_context(default_context, s, rng, context_space))
+                    eval_scenarios.append((label, sampler, False))
         else:
             RUN_RANDOM = os.environ.get('RUN_RANDOM') == '1'
             RUN_HIGH = os.environ.get('RUN_HIGH') == '1'
@@ -257,7 +323,7 @@ def evaluate_carl(cfg: dict):
                 RUN_RANDOM = RUN_HIGH = RUN_LOW = RUN_NORMAL = True
 
             if RUN_NORMAL:
-                eval_scenarios.append(("Baseline / Normal (1.0x)", default_context.copy()))
+                eval_scenarios.append(("Baseline / Normal (1.0x)", default_context.copy(), True))
 
             if BIGPICTURE:
                 all_low = default_context.copy()
@@ -266,47 +332,66 @@ def evaluate_carl(cfg: dict):
                 for feature_name, default_value in default_context.items():
                     if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
                         continue
-                    all_low[feature_name] = default_value * 0.5
-                    all_high[feature_name] = default_value * 1.5
+                    all_low[feature_name] = perturb_value(feature_name, default_value, 0.5, context_space)
+                    all_high[feature_name] = perturb_value(feature_name, default_value, 1.5, context_space)
                     # Random multiplier between 0.5 and 1.5
-                    all_random[feature_name] = default_value * np.random.uniform(0.5, 1.5)
+                    all_random[feature_name] = perturb_value(feature_name, default_value, np.random.uniform(0.5, 1.5), context_space)
                 if RUN_RANDOM:
-                    eval_scenarios.append(("All Params Random (0.5x - 1.5x)", all_random))
+                    eval_scenarios.append(("All Params Random (0.5x - 1.5x)", all_random, False))
                 if RUN_LOW:
-                    eval_scenarios.append(("All Params Low (-50%)", all_low))
+                    eval_scenarios.append(("All Params Low (-50%)", all_low, False))
                 if RUN_HIGH:
-                    eval_scenarios.append(("All Params High (+50%)", all_high))
+                    eval_scenarios.append(("All Params High (+50%)", all_high, False))
             else:
                 for feature_name, default_value in default_context.items():
                     if not isinstance(default_value, (int, float)) or 'timestep' in feature_name.lower():
                         continue
                     ctx_low = default_context.copy()
-                    ctx_low[feature_name] = default_value * 0.5
+                    ctx_low[feature_name] = perturb_value(feature_name, default_value, 0.5, context_space)
 
                     ctx_high = default_context.copy()
-                    ctx_high[feature_name] = default_value * 1.5
+                    ctx_high[feature_name] = perturb_value(feature_name, default_value, 1.5, context_space)
 
                     ctx_random = default_context.copy()
                     random_mult = np.random.uniform(0.5, 1.5)
-                    ctx_random[feature_name] = default_value * random_mult
+                    ctx_random[feature_name] = perturb_value(feature_name, default_value, random_mult, context_space)
 
                     if RUN_RANDOM:
-                        eval_scenarios.append((f"{feature_name} = {ctx_random[feature_name]:.4f} (Random {random_mult:.2f}x)", ctx_random))
+                        eval_scenarios.append((f"{feature_name} = {ctx_random[feature_name]:.4f} (Random {random_mult:.2f}x)", ctx_random, False))
                     if RUN_LOW:
-                        eval_scenarios.append((f"{feature_name} = {ctx_low[feature_name]:.4f} (Low)", ctx_low))
+                        eval_scenarios.append((f"{feature_name} = {ctx_low[feature_name]:.4f} (Low)", ctx_low, False))
                     if RUN_HIGH:
-                        eval_scenarios.append((f"{feature_name} = {ctx_high[feature_name]:.4f} (High)", ctx_high))
+                        eval_scenarios.append((f"{feature_name} = {ctx_high[feature_name]:.4f} (High)", ctx_high, False))
 
-        for mod_label, ctx_dict in eval_scenarios:
+        for mod_label, ctx_dict_or_sampler, is_baseline in eval_scenarios:
             print(colored(f'Evaluating {mod_label}', 'cyan'))
-            contexts = {0: ctx_dict}
-            
-            try:
-                env = make_carl_env(cfg, domain, task, contexts=contexts)
-            except ValueError as e:
-                print(colored(f"  Skipping scenario due to physics constraints: {e}", "red"))
-                continue
-                
+
+            env = None
+            if callable(ctx_dict_or_sampler):
+                # Randomized sweep scenario: retry with a freshly resampled context if
+                # a draw turns out physically infeasible (e.g. finger geometry where
+                # limb lengths can't jointly reach the spinner -- a constraint across
+                # multiple features that no single feature's own bound can prevent).
+                last_err = None
+                for _attempt in range(MAX_RETRY_ATTEMPTS):
+                    ctx = ctx_dict_or_sampler()
+                    try:
+                        env = make_carl_env(cfg, domain, task, contexts={0: ctx})
+                        break
+                    except ValueError as e:
+                        last_err = e
+                        env = None
+                if env is None:
+                    print(colored(f"  Skipping scenario after {MAX_RETRY_ATTEMPTS} resample attempts "
+                                  f"(physics infeasible): {last_err}", "red"))
+                    continue
+            else:
+                try:
+                    env = make_carl_env(cfg, domain, task, contexts={0: ctx_dict_or_sampler})
+                except ValueError as e:
+                    print(colored(f"  Skipping scenario due to physics constraints: {e}", "red"))
+                    continue
+
             ep_rewards, ep_successes = [], []
             for i in range(cfg.eval_episodes):
                 obs, done, ep_reward, t = env.reset(), False, 0, 0
@@ -356,13 +441,25 @@ def evaluate_carl(cfg: dict):
 
             mean_reward = np.mean(ep_rewards)
             mean_success = np.mean(ep_successes)
+
+            if is_baseline and getattr(cfg, 'multitask', False):
+                # Same normalization convention as evaluate.py's multitask score.
+                baseline_scores.append(mean_success * 100 if task_str.startswith('mw-') else mean_reward / 10)
+
             if sweep_enabled:
                 if baseline_reward is None:
                     baseline_reward = mean_reward
                 retention = mean_reward / baseline_reward if baseline_reward != 0 else float('nan')
+                if not is_baseline:
+                    all_retentions.append(retention)
                 print(colored(f'  Result -> R: {mean_reward:.01f} | S: {mean_success:.02f} | Retention: {retention:.02f}', 'green'))
             else:
                 print(colored(f'  Result -> R: {mean_reward:.01f} | S: {mean_success:.02f}', 'green'))
+
+    if baseline_scores:
+        print(colored(f'\nBaseline Normalized Score (s=0 / unperturbed, mt30-style): {np.mean(baseline_scores):.02f}', 'yellow', attrs=['bold']))
+    if all_retentions:
+        print(colored(f'Overall Mean Retention across perturbed scenarios (all tasks): {np.mean(all_retentions):.02f}', 'yellow', attrs=['bold']))
 
 import sys
 if __name__ == '__main__':
