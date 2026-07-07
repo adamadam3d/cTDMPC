@@ -377,11 +377,15 @@ def evaluate_carl(cfg: dict):
                             baseline_scores, all_retentions)
 
         if baseline_scores:
-            metrics['baseline_normalized_score'] = np.mean(baseline_scores)
+            # nanmean: a single task with an undefined (nan) score (e.g. zero
+            # baseline reward) must not blank out the whole checkpoint's summary.
+            metrics['baseline_normalized_score'] = np.nanmean(baseline_scores)
             print(colored(f'\nBaseline Normalized Score (s=0 / unperturbed, mt30-style): {metrics["baseline_normalized_score"]:.02f}', 'yellow', attrs=['bold']))
         if all_retentions:
-            metrics['overall_mean_retention'] = np.mean(all_retentions)
-            print(colored(f'Overall Mean Retention across perturbed scenarios (all tasks): {metrics["overall_mean_retention"]:.02f}', 'yellow', attrs=['bold']))
+            n_nan = np.sum(np.isnan(all_retentions))
+            metrics['overall_mean_retention'] = np.nanmean(all_retentions)
+            nan_note = f' ({n_nan}/{len(all_retentions)} scenarios had undefined retention: zero baseline reward)' if n_nan else ''
+            print(colored(f'Overall Mean Retention across perturbed scenarios (all tasks): {metrics["overall_mean_retention"]:.02f}{nan_note}', 'yellow', attrs=['bold']))
         if logger.wandb:
             # Same convention as evaluate_checkpoints.py: `iteration` is the x-axis,
             # metrics are prefixed with the category by Logger.log.
