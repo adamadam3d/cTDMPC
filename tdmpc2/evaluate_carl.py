@@ -23,6 +23,16 @@ CARL_ENV_MAP = {
     'quadruped': CARLDmcQuadrupedEnv
 }
 
+# Every dm_control task CARL can wrap for these 4 domains, including the tasks beyond
+# the mt30 subset (e.g. walker-arabesque, quadruped-escape). Only runs with -F.
+FULL_CARL_TASKS = [
+    'walker-stand', 'walker-walk', 'walker-run', 'walker-walk-backwards', 'walker-run-backwards',
+    'walker-arabesque', 'walker-lie-down', 'walker-legs-up', 'walker-headstand', 'walker-flip', 'walker-backflip',
+    'fish-upright', 'fish-swim', 'fish-obstacles',
+    'finger-spin', 'finger-turn-easy', 'finger-turn-hard',
+    'quadruped-walk', 'quadruped-run', 'quadruped-escape', 'quadruped-fetch',
+]
+
 from envs.dmcontrol import suite
 from dm_control.rl.control import PhysicsError
 import gymnasium as gym
@@ -230,10 +240,16 @@ def evaluate_carl(cfg: dict):
     sweep_enabled = sweep_auto or sweep_values is not None
 
     BIGPICTURE = os.environ.get('BIGPICTURE') == '1' or cfg.get('BIGPICTURE', False) or cfg.get('bigpicture', False)
+    FULL_CARL = os.environ.get('FULL_CARL') == '1'
 
     eval_tasks_override = os.environ.get('EVAL_TASKS')
     if eval_tasks_override:
         target_tasks = eval_tasks_override.split(',')
+    elif FULL_CARL:
+        target_tasks = FULL_CARL_TASKS
+        print(colored(f"FULL mode (-F) enabled: running all {len(FULL_CARL_TASKS)} CARL-wrappable "
+                      f"dm_control tasks across walker/fish/finger/quadruped (beyond the mt30 subset).",
+                      "yellow", attrs=['bold']))
     elif BIGPICTURE:
         target_tasks = ['walker-run', 'fish-swim', 'finger-spin']
         print(colored("BIGPICTURE mode (-B) enabled: running walker-run, fish-swim, finger-spin", "yellow", attrs=['bold']))
@@ -480,6 +496,9 @@ if __name__ == '__main__':
     if '-B' in sys.argv:
         os.environ['BIGPICTURE'] = '1'
         sys.argv.remove('-B')
+    if '-F' in sys.argv:
+        os.environ['FULL_CARL'] = '1'
+        sys.argv.remove('-F')
     if '-n' in sys.argv:
         os.environ['RUN_NORMAL'] = '1'
         sys.argv.remove('-n')
