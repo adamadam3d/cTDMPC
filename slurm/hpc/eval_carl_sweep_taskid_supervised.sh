@@ -39,6 +39,15 @@
 # NOTE: num_shards depends on PROCS_PER_GPU and GPUS_PER_COMBO -- do NOT run two
 # submissions with different packings for the SAME combo concurrently, or the
 # shards would evaluate overlapping checkpoint sets.
+#
+# DEPENDENCY: tdmpc2.sif does NOT ship the `carl` package. It is installed once
+# to the beegfs dir below and injected via PYTHONPATH. To (re)install:
+#   singularity exec --home /mnt/beegfs/data/AI-REEFSHIELD/tdm/cTDMPC/tdmpc2/ \
+#       /mnt/beegfs/public/images/tdmpc2.sif \
+#       python -m pip install --no-deps --target=/mnt/beegfs/data/AI-REEFSHIELD/tdm/pip_extras carl-bench
+# (--no-deps on purpose: the container's dm_control/gymnasium/mujoco pins must
+# not be upgraded; install any genuinely-missing dep the same way, one by one.)
+CARL_PYTHONPATH=/mnt/beegfs/data/AI-REEFSHIELD/tdm/pip_extras
 
 # One entry per combo: "<context_encoder> <seed> <wandb_project>"
 COMBOS=(
@@ -78,6 +87,14 @@ if [ -z "$WANDB_API_KEY" ]; then
     exit 1
 fi
 export SINGULARITYENV_WANDB_API_KEY=$WANDB_API_KEY
+
+# CARL lives outside the image (see DEPENDENCY note above). Fail fast with a
+# clear message if the one-time install has not been done yet.
+if [ ! -d "$CARL_PYTHONPATH/carl" ]; then
+    echo "ERROR: carl not found at $CARL_PYTHONPATH — run the pip install command in this script's header first" >&2
+    exit 1
+fi
+export SINGULARITYENV_PYTHONPATH=$CARL_PYTHONPATH${SINGULARITYENV_PYTHONPATH:+:$SINGULARITYENV_PYTHONPATH}
 
 # Simultaneous torch.compile runs exhaust host RAM (std::bad_alloc in
 # inductor): each process spawns ~one compile worker per core by default.
