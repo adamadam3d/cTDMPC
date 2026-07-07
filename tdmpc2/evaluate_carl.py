@@ -24,6 +24,7 @@ CARL_ENV_MAP = {
 }
 
 from envs.dmcontrol import suite
+from dm_control.rl.control import PhysicsError
 import gymnasium as gym
 import numpy as np
 
@@ -366,78 +367,86 @@ def evaluate_carl(cfg: dict):
         for mod_label, ctx_dict_or_sampler, is_baseline in eval_scenarios:
             print(colored(f'Evaluating {mod_label}', 'cyan'))
 
-            env = None
-            if callable(ctx_dict_or_sampler):
-                # Randomized sweep scenario: retry with a freshly resampled context if
-                # a draw turns out physically infeasible (e.g. finger geometry where
-                # limb lengths can't jointly reach the spinner -- a constraint across
-                # multiple features that no single feature's own bound can prevent).
-                last_err = None
-                for _attempt in range(MAX_RETRY_ATTEMPTS):
-                    ctx = ctx_dict_or_sampler()
-                    try:
-                        env = make_carl_env(cfg, domain, task, contexts={0: ctx})
-                        break
-                    except ValueError as e:
-                        last_err = e
-                        env = None
-                if env is None:
-                    print(colored(f"  Skipping scenario after {MAX_RETRY_ATTEMPTS} resample attempts "
-                                  f"(physics infeasible): {last_err}", "red"))
-                    continue
-            else:
+            # Retry the WHOLE attempt (context draw + env construction + full episode
+            # rollout) on failure. Two distinct failure modes can occur: CARL raises
+            # ValueError at construction time for a jointly-infeasible context (e.g.
+            # finger geometry that can't reach the spinner), or MuJoCo raises
+            # PhysicsError mid-rollout when an extreme perturbation makes the
+            # simulation numerically unstable (NaN/Inf/huge QACC). Both are treated
+            # the same: for randomized scenarios, resample and try again; for
+            # deterministic scenarios (baseline/Low/High) there's nothing to resample,
+            # so a single failure just skips that scenario.
+            is_random = callable(ctx_dict_or_sampler)
+            max_attempts = MAX_RETRY_ATTEMPTS if is_random else 1
+            ep_rewards, ep_successes = None, None
+            last_err = None
+
+            for _attempt in range(max_attempts):
+                ctx = ctx_dict_or_sampler() if is_random else ctx_dict_or_sampler
                 try:
-                    env = make_carl_env(cfg, domain, task, contexts={0: ctx_dict_or_sampler})
+                    env = make_carl_env(cfg, domain, task, contexts={0: ctx})
                 except ValueError as e:
-                    print(colored(f"  Skipping scenario due to physics constraints: {e}", "red"))
+                    last_err = e
                     continue
 
-            ep_rewards, ep_successes = [], []
-            for i in range(cfg.eval_episodes):
-                obs, done, ep_reward, t = env.reset(), False, 0, 0
-                while not done:
-                    # Multitask agents expect padded observations and output padded actions
-                    is_mt = getattr(cfg, 'multitask', False)
-                    if is_mt:
-                        expected_obs_dim = max(cfg.obs_shapes)
-                        if obs.shape[0] < expected_obs_dim:
-                            padding = torch.zeros(expected_obs_dim - obs.shape[0], dtype=obs.dtype, device=obs.device)
-                            padded_obs = torch.cat((obs, padding))
-                        elif obs.shape[0] > expected_obs_dim:
-                            padded_obs = obs[:expected_obs_dim]
-                        else:
-                            padded_obs = obs
-                    else:
-                        padded_obs = obs
-                        
-                    # Agent act uses task_idx for encoders like task_id
-                    action = agent.act(padded_obs, t0=t==0, task=task_idx)
-                    prev_obs = padded_obs
-                    
-                    env_action = action
-                    if env_action.shape[0] < env.action_space.shape[0]:
-                        padding = torch.zeros(env.action_space.shape[0] - env_action.shape[0], dtype=env_action.dtype, device=env_action.device)
-                        env_action = torch.cat((env_action, padding))
-                    elif env_action.shape[0] > env.action_space.shape[0]:
-                        env_action = env_action[:env.action_space.shape[0]]
-                        
-                    obs, reward, done, info = env.step(env_action)
-                    
-                    # Multi-task context encoders require updating context
-                    if is_mt:
-                        if obs.shape[0] < expected_obs_dim:
-                            next_padded_obs = torch.cat((obs, torch.zeros(expected_obs_dim - obs.shape[0], dtype=obs.dtype, device=obs.device)))
-                        elif obs.shape[0] > expected_obs_dim:
-                            next_padded_obs = obs[:expected_obs_dim]
-                        else:
-                            next_padded_obs = obs
-                        agent.update_context(prev_obs, action, reward, next_padded_obs)
-                        
-                    ep_reward += reward
-                    t += 1
-                
-                ep_rewards.append(ep_reward)
-                ep_successes.append(info.get('success', 0.0))
+                try:
+                    ep_rewards, ep_successes = [], []
+                    for i in range(cfg.eval_episodes):
+                        obs, done, ep_reward, t = env.reset(), False, 0, 0
+                        while not done:
+                            # Multitask agents expect padded observations and output padded actions
+                            is_mt = getattr(cfg, 'multitask', False)
+                            if is_mt:
+                                expected_obs_dim = max(cfg.obs_shapes)
+                                if obs.shape[0] < expected_obs_dim:
+                                    padding = torch.zeros(expected_obs_dim - obs.shape[0], dtype=obs.dtype, device=obs.device)
+                                    padded_obs = torch.cat((obs, padding))
+                                elif obs.shape[0] > expected_obs_dim:
+                                    padded_obs = obs[:expected_obs_dim]
+                                else:
+                                    padded_obs = obs
+                            else:
+                                padded_obs = obs
+
+                            # Agent act uses task_idx for encoders like task_id
+                            action = agent.act(padded_obs, t0=t==0, task=task_idx)
+                            prev_obs = padded_obs
+
+                            env_action = action
+                            if env_action.shape[0] < env.action_space.shape[0]:
+                                padding = torch.zeros(env.action_space.shape[0] - env_action.shape[0], dtype=env_action.dtype, device=env_action.device)
+                                env_action = torch.cat((env_action, padding))
+                            elif env_action.shape[0] > env.action_space.shape[0]:
+                                env_action = env_action[:env.action_space.shape[0]]
+
+                            obs, reward, done, info = env.step(env_action)
+
+                            # Multi-task context encoders require updating context
+                            if is_mt:
+                                if obs.shape[0] < expected_obs_dim:
+                                    next_padded_obs = torch.cat((obs, torch.zeros(expected_obs_dim - obs.shape[0], dtype=obs.dtype, device=obs.device)))
+                                elif obs.shape[0] > expected_obs_dim:
+                                    next_padded_obs = obs[:expected_obs_dim]
+                                else:
+                                    next_padded_obs = obs
+                                agent.update_context(prev_obs, action, reward, next_padded_obs)
+
+                            ep_reward += reward
+                            t += 1
+
+                        ep_rewards.append(ep_reward)
+                        ep_successes.append(info.get('success', 0.0))
+                    break  # all episodes completed without a physics failure
+                except PhysicsError as e:
+                    last_err = e
+                    ep_rewards, ep_successes = None, None
+                    continue
+
+            if ep_rewards is None:
+                reason = f'{max_attempts} resample attempts' if is_random else 'the attempt'
+                print(colored(f"  Skipping scenario after {reason} "
+                              f"(physics infeasible/unstable): {last_err}", "red"))
+                continue
 
             mean_reward = np.mean(ep_rewards)
             mean_success = np.mean(ep_successes)
