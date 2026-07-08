@@ -134,17 +134,26 @@ scratch once #2 and #3 exist.
       `results/tdmpc2/*.csv` are the published experts but are **non-CARL**
       (unperturbed env, different y-normalization) — needs a defensible common
       normalization before overlaying, else apples-to-oranges.
-- [ ] Negative-transfer gap bar chart (single-task − multi-task return),
-      E1 vs E2 — blocked on the same per-task CARL expert-return question.
-- [ ] Gradient-conflict-rate comparison, E1 vs E2 — data already logged
-      (`grad_conflict_frac`), just needs pulling + plotting. Caveat: it is
-      measured only at eval points (eval_freq=500k → ~6 points over a 3M run),
-      so this supports a summary comparison / coarse trend, not a dense curve.
-- [ ] Zero-shot return vs. sweep magnitude (interpolation/extrapolation),
-      E1 vs E2 — data already logged via `evaluate_carl.py --sweep`, just
-      needs pulling + plotting.
-- [ ] Held-out model-prediction error (consistency/reward), E1 vs E2 — ready
-      once #1 (the CARL re-run) lands.
+- [x] Negative-transfer gap (fraction of single-task-expert ceiling retained),
+      E1 vs E2 — `fig_negative_transfer`. Uses published TD-MPC2 experts
+      (`results/tdmpc2/`, non-CARL: gap is indicative, not a same-harness
+      ablation). Result: supervised retains a uniform ~0.43–0.53 across all 4
+      walker tasks; task_id is bimodal (0.90/0.71 fwd, 0.16/0.09 back); both
+      collapse to ~0 on fingers (flag: real negative transfer, or a CARL
+      finger-domain harness issue? worth one check).
+- [x] Zero-shot return vs. sweep magnitude, E1 vs E2 — `fig_sweep`
+      (dose-response, IQM(perturbed)/IQM(baseline), fingers excluded). Both
+      degrade; at max severity task_id retains 0.41 vs supervised 0.28.
+      CAVEAT: mid-severity points are noisy/non-monotonic at 3 seeds (wide CIs,
+      one clipped off-scale) — lean on the endpoint, not the shape.
+- [ ] Gradient-conflict-rate comparison, E1 vs E2 — `grad_conflict_frac` is
+      logged during TRAINING, not in the CARL eval projects. TODO: find which
+      project holds the seed3/4/5 {task_id,supervised}_param5 training runs
+      (not `supervised_paramsweep`, that's the seed5 loss sweep), then pull +
+      plot. Coarse (eval-point cadence), so a summary comparison.
+- [ ] Held-out model-prediction error (consistency/reward), E1 vs E2 — pull
+      the `consistency_error+*` / `reward_error+*` columns from the
+      `secondrun_*` projects (that is what they exist for) + plot.
 - [ ] Context-recovery scatter + clustering plot — needs #3.
 
 ## 5. Lower priority

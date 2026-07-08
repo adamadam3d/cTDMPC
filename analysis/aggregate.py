@@ -294,6 +294,160 @@ def curves(df, tasks, n_boot, args):
     return out
 
 
+def load_wandb_scenarios(tasks, projects):
+    """Pull baseline + sweep-scenario returns at the FINAL checkpoint.
+
+    The auto sweep logs episode_reward+<task> (s=0 baseline) and
+    episode_reward+<task>+scn{1..4} at s = {0.25,0.5,0.75,1.0} x the task's own
+    physical s_max. Returns tidy [encoder, seed, task, scn, frac, return_raw]
+    with scn=0 the baseline (frac=0). We keep only each (encoder, seed) run's
+    max-iteration rows so this is the converged model's dose-response.
+    """
+    import wandb
+    api = wandb.Api()
+    rows = []
+    for enc, project in projects.items():
+        runs = api.runs(f'{ENTITY}/{project}')
+        for run in runs:
+            seed = run.config.get('seed')
+            if seed is None:
+                continue
+            keys = ['pretrain/iteration']
+            for t in tasks:
+                keys.append(f'pretrain/episode_reward+{t}')
+                keys += [f'pretrain/episode_reward+{t}+scn{i}' for i in (1, 2, 3, 4)]
+            present = [k for k in keys if k == 'pretrain/iteration' or k in run.summary.keys()]
+            if len(present) <= 1:
+                continue
+            hist = run.history(keys=present, pandas=True)
+            if hist is None or hist.empty:
+                continue
+            for _, r in hist.iterrows():
+                it = r.get('pretrain/iteration')
+                if pd.isna(it):
+                    continue
+                for t in tasks:
+                    base_col = f'pretrain/episode_reward+{t}'
+                    if base_col in r and not pd.isna(r[base_col]):
+                        rows.append((enc, int(seed), int(it), t, 0, 0.0, float(r[base_col])))
+                    for i in (1, 2, 3, 4):
+                        c = f'pretrain/episode_reward+{t}+scn{i}'
+                        if c in r and not pd.isna(r[c]):
+                            rows.append((enc, int(seed), int(it), t, i, i * 0.25, float(r[c])))
+    df = pd.DataFrame(rows, columns=['encoder', 'seed', 'iteration', 'task', 'scn', 'frac', 'return_raw'])
+    df = df.drop_duplicates(['encoder', 'seed', 'iteration', 'task', 'scn'], keep='last')
+    # Keep only each run's converged (max-iteration) rows.
+    fin_it = df.groupby('encoder').iteration.transform('max')
+    return df[df.iteration == fin_it].copy()
+
+
+def _mat(series, seeds, tasks):
+    """(n_seeds, n_tasks) matrix from a (seed, task)-indexed return Series."""
+    m = np.full((len(seeds), len(tasks)), np.nan)
+    for si, s in enumerate(seeds):
+        for ti, t in enumerate(tasks):
+            v = series.get((s, t))
+            if v is not None and not pd.isna(v):
+                m[si, ti] = v
+    return m
+
+
+def sweep_curve(scen_df, tasks, n_boot, args, min_baseline=50.0):
+    """Dose-response: return retention vs perturbation severity, per encoder.
+
+    retention = IQM(perturbed returns) / IQM(baseline returns), aggregated over
+    the (task, seed) matrix at each severity. This aggregate-then-ratio form is
+    stable: a per-(task,seed) ratio blows up when a task's baseline is small
+    (fish-swim), so IQM-of-ratios produced a spurious CI spike. Tasks with a
+    near-zero raw baseline (fingers) are dropped via min_baseline. CI is a paired
+    seed bootstrap (resample seeds once, recompute both IQMs, take the ratio).
+    """
+    rng = np.random.default_rng(args.seed)
+    rows = []
+    for enc in ENCODERS:
+        d = scen_df[scen_df.encoder == enc]
+        seeds = sorted(d.seed.unique())
+        base = d[d.scn == 0].set_index(['seed', 'task']).return_raw
+        keep = [t for t in tasks
+                if base.reindex([(s, t) for s in seeds]).mean() >= min_baseline]
+        base_mat = _mat(base, seeds, keep)
+        for scn, frac in [(0, 0.0), (1, .25), (2, .5), (3, .75), (4, 1.0)]:
+            cur_mat = _mat(d[d.scn == scn].set_index(['seed', 'task']).return_raw, seeds, keep)
+            point = iqm(cur_mat.flatten()) / iqm(base_mat.flatten())
+            boot = np.empty(n_boot)
+            for b in range(n_boot):
+                r = rng.integers(0, len(seeds), size=len(seeds))
+                boot[b] = iqm(cur_mat[r].flatten()) / iqm(base_mat[r].flatten())
+            lo, hi = np.nanpercentile(boot, [2.5, 97.5])
+            rows.append({'encoder': enc, 'scn': scn, 'frac': frac,
+                         'iqm_retention': point, 'ci_lo': float(lo), 'ci_hi': float(hi),
+                         'n_tasks': len(keep)})
+    out = pd.DataFrame(rows)
+    out.to_csv(args.outdir / 'sweep_curve.csv', index=False)
+    print('\n=== Dose-response: IQM(perturbed)/IQM(baseline) vs perturbation severity ===')
+    print(out.to_string(index=False, float_format=lambda x: f'{x:.2f}'))
+    print(f'Wrote {args.outdir / "sweep_curve.csv"}')
+    return out
+
+
+def load_experts(experts_dir, tasks):
+    """Per-task published TD-MPC2 single-task expert return (raw dm_control).
+
+    results/tdmpc2/<task>.csv has columns step,reward,seed. We take each seed's
+    converged return (mean of its last few logged steps, to de-noise the final
+    point) then average over seeds. These experts are trained on the UNPERTURBED
+    env, so they are the ceiling for the s=0 baseline scenario -- comparable to
+    our multitask baseline return, which is also evaluated at the default
+    context. (Caveat for the writeup: expert seeds/harness differ from the CARL
+    eval; treat the gap as indicative, not a controlled ablation.)
+    """
+    experts_dir = Path(experts_dir)
+    out = {}
+    for task in tasks:
+        fp = experts_dir / f'{task}.csv'
+        if not fp.exists():
+            continue
+        e = pd.read_csv(fp)
+        per_seed = []
+        for _, g in e.groupby('seed'):
+            g = g.sort_values('step')
+            per_seed.append(g.reward.tail(3).mean())  # converged return
+        out[task] = float(np.mean(per_seed))
+    return out
+
+
+def negative_transfer(df, tasks, experts_dir, args):
+    """Negative-transfer gap vs single-task experts, per task per encoder.
+
+    gap = expert - multitask_baseline (raw return); retained = multitask/expert
+    (fraction of the single-task ceiling kept -- comparable across tasks, unlike
+    the raw gap where finger's ~980 dwarfs the walker gaps). Uses the s=0
+    baseline (default context) return at the final checkpoint.
+    """
+    experts = load_experts(experts_dir, tasks)
+    if not experts:
+        print(f'\n[skip negative-transfer] no expert CSVs under {experts_dir}')
+        return None
+    fin = df[df.iteration == df.groupby('encoder').iteration.transform('max')]
+    base = fin.groupby(['encoder', 'task']).return_raw.mean().reset_index()
+    rows = []
+    for _, r in base.iterrows():
+        exp = experts.get(r.task)
+        if exp is None or exp == 0:
+            continue
+        rows.append({'encoder': r.encoder, 'task': r.task,
+                     'multitask': r.return_raw, 'expert': exp,
+                     'gap': exp - r.return_raw,
+                     'retained_frac': r.return_raw / exp})
+    out = pd.DataFrame(rows)
+    out.to_csv(args.outdir / 'negative_transfer.csv', index=False)
+    print('\n=== Negative transfer vs single-task experts (fraction of ceiling retained) ===')
+    piv = out.pivot(index='task', columns='encoder', values='retained_frac')
+    print(piv.to_string(float_format=lambda x: f'{x:.2f}'))
+    print(f'Wrote {args.outdir / "negative_transfer.csv"}')
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -312,6 +466,12 @@ def main():
                     help='(wandb source) task_id project; default is the 10-episode run-1 project')
     ap.add_argument('--supervised-project', default=PROJECTS['supervised'],
                     help='(wandb source) supervised project; default is the 10-episode run-1 project')
+    ap.add_argument('--experts-dir', default='results/tdmpc2',
+                    help='dir of published single-task expert CSVs for the negative-transfer gap')
+    ap.add_argument('--sweep', action='store_true',
+                    help='also pull sweep-scenario returns and emit the dose-response curve')
+    ap.add_argument('--sweep-cache', type=Path, default=None,
+                    help='parquet cache for the (heavier) scenario pull')
     args = ap.parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
     projects = {'task_id': args.taskid_project, 'supervised': args.supervised_project}
@@ -329,8 +489,22 @@ def main():
         raise SystemExit('No rows loaded -- check --source / project names / tasks.')
 
     summarize(df, args.tasks, args.n_boot, args)
+    negative_transfer(df, args.tasks, args.experts_dir, args)
     if args.curves:
         curves(df, args.tasks, args.n_boot, args)
+    if args.sweep:
+        if args.sweep_cache and args.sweep_cache.exists():
+            print(f'\nLoading cached scenario frame {args.sweep_cache}')
+            scen = pd.read_parquet(args.sweep_cache)
+        else:
+            scen = load_wandb_scenarios(args.tasks, projects)
+            if args.sweep_cache:
+                scen.to_parquet(args.sweep_cache)
+                print(f'Cached scenario frame -> {args.sweep_cache}')
+        if scen.empty:
+            print('[skip sweep] no scenario rows loaded')
+        else:
+            sweep_curve(scen, args.tasks, args.n_boot, args)
 
 
 if __name__ == '__main__':
