@@ -125,10 +125,17 @@ scratch once #2 and #3 exist.
       per-task expert runs exist anywhere (older wandb projects?) or whether
       published TD-MPC2 single-task scores will be used; if neither, these
       runs are missing from the critical path and are expensive.
-- [ ] Aggregate + per-task learning curves (IQM, 95% CI), E1 vs E2 vs
-      single-task experts.
+- [x] `analysis/plots.py` — IQM learning curves (E1 vs E2, 95% CI bands) and
+      the per-task return bar chart (the redistribution result). dataviz-skill
+      styled (blue=task_id, aqua=supervised, held stable across figures;
+      validated palette; legend + direct labels). Reads aggregate.py's CSVs,
+      writes PNG+PDF to `analysis/out/figs/`.
+- [ ] Add the single-task-expert overlay to the learning curves. Deferred:
+      `results/tdmpc2/*.csv` are the published experts but are **non-CARL**
+      (unperturbed env, different y-normalization) — needs a defensible common
+      normalization before overlaying, else apples-to-oranges.
 - [ ] Negative-transfer gap bar chart (single-task − multi-task return),
-      E1 vs E2.
+      E1 vs E2 — blocked on the same per-task CARL expert-return question.
 - [ ] Gradient-conflict-rate comparison, E1 vs E2 — data already logged
       (`grad_conflict_frac`), just needs pulling + plotting. Caveat: it is
       measured only at eval points (eval_freq=500k → ~6 points over a 3M run),
