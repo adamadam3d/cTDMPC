@@ -2,23 +2,36 @@
 Publication figures for the CARL generalization comparison (TODO #4), built from
 the aggregate.py outputs (analysis/out/*.csv).
 
-Two figures are ready from the data that exists now:
-  A. IQM learning curves, task_id vs supervised, with 95% stratified-bootstrap
-     CI bands (from iqm_curves.csv).
-  B. Per-task return at the final checkpoint, task_id vs supervised, sorted by
-     the supervised-minus-task_id gap (from paired_per_task.csv) -- the
-     redistribution result: supervised lifts the backward-walker tasks while
-     ceding the forward ones.
+Six figures, each rendered only if its input CSV exists (run the matching
+aggregate.py flag first -- see each fig_* function's docstring for which):
+  A. fig_learning_curves    IQM return over training, 95% CI bands.
+  B. fig_per_task           per-task return at the final checkpoint -- the
+                            redistribution result (supervised lifts the
+                            backward-walker tasks, cedes the forward ones).
+  C. fig_negative_transfer  fraction of the published single-task-expert
+                            ceiling retained, per task. Caveat baked into
+                            aggregate.py: experts are non-CARL runs (different
+                            seeds/harness), so this gap is indicative, not a
+                            controlled same-harness ablation.
+  D. fig_sweep              dose-response (return retention) vs perturbation
+                            severity; y-axis capped with off-scale CI
+                            annotated (3-seed mid-severity noise).
+  E. fig_grad_conflict      cross-task gradient-conflict fraction over
+                            training, from the eval50k/supervised_eval
+                            projects (dense, every-50k-checkpoint re-eval, NOT
+                            the sparse training-time log). Quantized to 1/15
+                            steps (grad_conflict_tasks=6 -> C(6,2)=15 pairs).
+  F. fig_model_error        held-out consistency_error / reward_error under
+                            CARL context shift, from the secondrun_* backfill
+                            (the one thing those projects are ground truth for).
+
+Not yet built: the context-recovery scatter (needs the probe, TODO #3).
 
 Design follows the dataviz skill: categorical hues assigned by ENTITY and held
-stable across figures (blue=task_id, aqua=supervised), thin marks, recessive
+stable across all figures (blue=task_id, aqua=supervised), thin marks, recessive
 axes/grid, text in ink tokens (never the series color), a legend plus direct
 labels (aqua is sub-3:1 on the light surface, so the relief rule requires
 visible labels -- and the CSVs are the table view).
-
-Not built yet (need more data): single-task-expert overlay / negative-transfer
-gap (needs per-task CARL expert returns), sweep-magnitude and model-error cuts
-(separate pulls), and the context-recovery scatter (needs the probe, TODO #3).
 """
 import argparse
 from pathlib import Path
@@ -221,6 +234,77 @@ def fig_sweep(sweep_csv, out_stem, fmt):
     return _save(fig, out_stem, fmt)
 
 
+def fig_grad_conflict(curve_csv, out_stem, fmt, smooth_window=5):
+    """Line only, no per-point markers: at ~60 points/line (every 50k steps)
+    markers add clutter, not information -- matches fig_learning_curves. The
+    raw signal is quantized (1/15 steps) and genuinely noisy (no trend, no
+    encoder gap -- see grad_conflict_summary's tail-average test), so a light
+    rolling mean is drawn on top of the raw (faint) line to make the "flat and
+    overlapping" read honest rather than looking like noise-hunting.
+    """
+    df = pd.read_csv(curve_csv)
+    fig, ax = plt.subplots(figsize=(7, 4.2))
+    for enc in ('task_id', 'supervised'):
+        d = df[df.encoder == enc].sort_values('iteration')
+        if d.empty:
+            continue
+        ax.plot(d.iteration, d.iqm_grad_conflict_frac, color=C[enc], linewidth=1,
+                alpha=0.35)
+        smoothed = d.iqm_grad_conflict_frac.rolling(smooth_window, center=True,
+                                                     min_periods=1).mean()
+        ax.fill_between(d.iteration, d.ci_lo, d.ci_hi, color=C[enc], alpha=0.10, linewidth=0)
+        ax.plot(d.iteration, smoothed, color=C[enc], linewidth=2.2, label=LABEL[enc])
+        last = d.iloc[-1]
+        ax.annotate(LABEL[enc], (last.iteration, smoothed.iloc[-1]),
+                    xytext=(6, 0), textcoords='offset points', va='center',
+                    color=C[enc], fontsize=9, fontweight='bold')
+    ax.xaxis.set_major_formatter(FuncFormatter(_millions))
+    ax.set_xlabel('training iteration')
+    ax.set_ylabel('gradient-conflict fraction (IQM over seeds)')
+    ax.set_title(f'Cross-task gradient conflict over training  ({smooth_window}-pt rolling mean; '
+                 'quantized to 1/15 steps)', fontsize=11, loc='left', pad=10)
+    ax.set_xlim(left=0)
+    ax.margins(y=0.15)
+    leg = ax.legend(loc='upper left', frameon=False, fontsize=9)
+    for t in leg.get_texts():
+        t.set_color(C['ink2'])
+    fig.tight_layout()
+    return _save(fig, out_stem, fmt)
+
+
+def fig_model_error(curve_csv, out_stem, fmt):
+    df = pd.read_csv(curve_csv)
+    metrics = [m for m in ('consistency_error', 'reward_error') if (df.metric == m).any()]
+    fig, axes = plt.subplots(1, len(metrics), figsize=(6.5 * len(metrics), 4.2))
+    axes = np.atleast_1d(axes)
+    titles = {'consistency_error': 'Consistency error (‖ẑ_pred − ẑ_true‖²)',
+             'reward_error': 'Reward error ((r̂ − r)²)'}
+    for ax, metric in zip(axes, metrics):
+        md = df[df.metric == metric]
+        for enc in ('task_id', 'supervised'):
+            d = md[md.encoder == enc].sort_values('iteration')
+            if d.empty:
+                continue
+            ax.fill_between(d.iteration, d.ci_lo, d.ci_hi, color=C[enc], alpha=0.15, linewidth=0)
+            ax.plot(d.iteration, d.iqm_error, color=C[enc], linewidth=2, label=LABEL[enc])
+            last = d.iloc[-1]
+            ax.annotate(LABEL[enc], (last.iteration, last.iqm_error),
+                        xytext=(6, 0), textcoords='offset points', va='center',
+                        color=C[enc], fontsize=9, fontweight='bold')
+        ax.xaxis.set_major_formatter(FuncFormatter(_millions))
+        ax.set_xlabel('training iteration')
+        ax.set_ylabel('IQM error (lower = better)')
+        ax.set_title(titles.get(metric, metric), fontsize=10, loc='left')
+        ax.set_xlim(left=0)
+        leg = ax.legend(loc='upper right', frameon=False, fontsize=8)
+        for t in leg.get_texts():
+            t.set_color(C['ink2'])
+    fig.suptitle('Held-out model-prediction error under CARL context shift',
+                 fontsize=11, x=0.02, ha='left', y=1.02)
+    fig.tight_layout()
+    return _save(fig, out_stem, fmt)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -252,6 +336,16 @@ def main():
         made += fig_sweep(sweep, str(args.outdir / 'fig_sweep'), args.format)
     else:
         print(f'[skip] {sweep} not found -- run aggregate.py --sweep first')
+    gc = args.indir / 'grad_conflict_curve.csv'
+    if gc.exists():
+        made += fig_grad_conflict(gc, str(args.outdir / 'fig_grad_conflict'), args.format)
+    else:
+        print(f'[skip] {gc} not found -- run aggregate.py --grad-conflict first')
+    me = args.indir / 'model_error_curve.csv'
+    if me.exists():
+        made += fig_model_error(me, str(args.outdir / 'fig_model_error'), args.format)
+    else:
+        print(f'[skip] {me} not found -- run aggregate.py --model-error first')
     print('Wrote:')
     for f in made:
         print(' ', f)

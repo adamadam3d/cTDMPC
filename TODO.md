@@ -146,15 +146,28 @@ scratch once #2 and #3 exist.
       degrade; at max severity task_id retains 0.41 vs supervised 0.28.
       CAVEAT: mid-severity points are noisy/non-monotonic at 3 seeds (wide CIs,
       one clipped off-scale) — lean on the endpoint, not the shape.
-- [ ] Gradient-conflict-rate comparison, E1 vs E2 — `grad_conflict_frac` is
-      logged during TRAINING, not in the CARL eval projects. TODO: find which
-      project holds the seed3/4/5 {task_id,supervised}_param5 training runs
-      (not `supervised_paramsweep`, that's the seed5 loss sweep), then pull +
-      plot. Coarse (eval-point cadence), so a summary comparison.
-- [ ] Held-out model-prediction error (consistency/reward), E1 vs E2 — pull
-      the `consistency_error+*` / `reward_error+*` columns from the
-      `secondrun_*` projects (that is what they exist for) + plot.
-- [ ] Context-recovery scatter + clustering plot — needs #3.
+- [x] Gradient-conflict-rate comparison, E1 vs E2 — `fig_grad_conflict`.
+      CORRECTION to the earlier note above: `grad_conflict_frac` is NOT sparse
+      training-time logging — `eval50k` (task_id) / `supervised_eval`
+      (supervised) are dedicated re-evaluation sweeps over every saved
+      checkpoint (~60 points/seed, every 50k steps), independent of the
+      training run's own `eval_freq`. Restricted to seeds {3,4,5} (`eval50k`
+      also has 6,7,8; `supervised_eval` has an uneven run count at seed 3/5 —
+      likely resubmissions, harmless since we dedupe/aggregate per seed).
+      Quantized to 1/15 steps (`grad_conflict_tasks=6` → C(6,2)=15 pairs), so
+      the summary uses a last-5-checkpoint tail average, not a single point.
+      Result: task_id 0.458 vs supervised 0.484, heavily overlapping CIs — **no
+      significant difference**, both noisy/flat the whole run. Plotted as a
+      5-point rolling mean (raw per-point markers were too dense/cluttered at
+      ~60 pts/line) with the faint raw line underneath.
+- [x] Held-out model-prediction error (consistency/reward), E1 vs E2 —
+      `fig_model_error`, from the `secondrun_*` backfill (the one thing those
+      projects are ground truth for). Result: task_id has clearly lower reward
+      error (0.13 vs 0.44 at final ckpt, CIs well separated) but higher
+      consistency error (0.0033 vs 0.0019, CIs barely separated) — encoders
+      trade off which prediction head degrades less under context shift.
+- [ ] Context-recovery scatter + clustering plot — needs #3 (probe not yet
+      launched).
 
 ## 5. Lower priority
 

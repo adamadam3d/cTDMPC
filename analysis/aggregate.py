@@ -42,6 +42,11 @@ DEFAULT_TASKS = [
 ]
 ENTITY = 'https-www-guc-edu-eg-'
 ENCODERS = ['task_id', 'supervised']
+# The eval_episodes=3/ckpt_stride=2 backfill (see TODO #1) -- these exist FOR
+# the consistency_error/reward_error columns, not for returns (too noisy at
+# 3 episodes to be the source of truth on returns; see PROJECTS below).
+SECONDRUN_PROJECTS = {'task_id': 'secondrun_taskid_generalizable',
+                      'supervised': 'secondrun_supervised_generalizable'}
 # Returns come from the ORIGINAL run (10 episodes/checkpoint, full checkpoint
 # grid). The secondrun_* projects are the eval_episodes=3 backfill -- their
 # returns are deliberately noisy and are NOT the source of truth for the return
@@ -390,6 +395,184 @@ def sweep_curve(scen_df, tasks, n_boot, args, min_baseline=50.0):
     return out
 
 
+def _metric_cols(columns, metric):
+    """Map `<metric>+<task>` columns (no +scn suffix) -> task name."""
+    out = {}
+    pat = re.compile(rf'(?:pretrain/)?{re.escape(metric)}\+([a-z0-9\-]+)')
+    for c in columns:
+        m = pat.fullmatch(c)
+        if m:
+            out[c] = m.group(1)
+    return out
+
+
+def load_model_error(tasks):
+    """Pull baseline (s=0) consistency_error/reward_error per (encoder, seed,
+    iteration, task) from the secondrun_* backfill projects -- this is the ONE
+    thing those projects are the source of truth for (see SECONDRUN_PROJECTS).
+    """
+    import wandb
+    api = wandb.Api()
+    rows = []
+    for enc, project in SECONDRUN_PROJECTS.items():
+        want = []
+        for t in tasks:
+            want += [f'pretrain/consistency_error+{t}', f'pretrain/reward_error+{t}']
+        for run in api.runs(f'{ENTITY}/{project}'):
+            seed = run.config.get('seed')
+            if seed is None:
+                continue
+            present = [k for k in want if k in run.summary.keys()]
+            if not present:
+                continue
+            hist = run.history(keys=['pretrain/iteration'] + present, pandas=True)
+            if hist is None or hist.empty:
+                continue
+            cons_cols = _metric_cols(hist.columns, 'consistency_error')
+            rew_cols = _metric_cols(hist.columns, 'reward_error')
+            for _, r in hist.iterrows():
+                it = r.get('pretrain/iteration')
+                if pd.isna(it):
+                    continue
+                for col, task in cons_cols.items():
+                    if task in tasks and not pd.isna(r.get(col)):
+                        rows.append((enc, int(seed), int(it), task, 'consistency_error', float(r[col])))
+                for col, task in rew_cols.items():
+                    if task in tasks and not pd.isna(r.get(col)):
+                        rows.append((enc, int(seed), int(it), task, 'reward_error', float(r[col])))
+    df = pd.DataFrame(rows, columns=['encoder', 'seed', 'iteration', 'task', 'metric', 'value'])
+    return df.drop_duplicates(['encoder', 'seed', 'iteration', 'task', 'metric'], keep='last')
+
+
+def model_error_summary(me_df, tasks, n_boot, args):
+    """Per-encoder IQM of held-out model-prediction error at the final
+    checkpoint, for each of consistency_error / reward_error, + a curve CSV.
+    Lower is better (these are prediction errors, not returns).
+    """
+    if me_df.empty:
+        print('\n[skip model-error] no rows loaded')
+        return None
+    seeds = sorted(me_df.seed.unique())
+    summary_rows, curve_rows = [], []
+    for metric in ('consistency_error', 'reward_error'):
+        md = me_df[me_df.metric == metric]
+        for enc in ENCODERS:
+            d = md[md.encoder == enc]
+            if d.empty:
+                continue
+            for it in sorted(d.iteration.unique()):
+                piv = d[d.iteration == it].pivot_table(index='seed', columns='task', values='value', aggfunc='mean')
+                mat = piv.reindex(index=seeds, columns=tasks).to_numpy()
+                if np.isnan(mat).all():
+                    continue
+                point, lo, hi = stratified_bootstrap_ci(mat, n_boot=n_boot, seed=args.seed)
+                curve_rows.append({'metric': metric, 'encoder': enc, 'iteration': it,
+                                   'iqm_error': point, 'ci_lo': lo, 'ci_hi': hi})
+            fin_it = d.iteration.max()
+            piv = d[d.iteration == fin_it].pivot_table(index='seed', columns='task', values='value', aggfunc='mean')
+            mat = piv.reindex(index=seeds, columns=tasks).to_numpy()
+            point, lo, hi = stratified_bootstrap_ci(mat, n_boot=n_boot, seed=args.seed)
+            summary_rows.append({'metric': metric, 'encoder': enc, 'iteration': int(fin_it),
+                                 'iqm_error': point, 'ci_lo': lo, 'ci_hi': hi})
+    summary = pd.DataFrame(summary_rows)
+    print('\n=== Held-out model-prediction error at final checkpoint (IQM, lower=better) ===')
+    print(summary.to_string(index=False, float_format=lambda x: f'{x:.4f}'))
+    pd.DataFrame(curve_rows).to_csv(args.outdir / 'model_error_curve.csv', index=False)
+    print(f'Wrote {args.outdir / "model_error_curve.csv"}')
+    return summary
+
+
+# Training-time projects (NOT the CARL eval projects): grad_conflict_frac /
+# grad_cos_mean are logged during pretraining at eval_freq cadence, one value
+# per checkpoint (not per task), so this uses a different project pair.
+GRAD_CONFLICT_PROJECTS = {'task_id': 'eval50k', 'supervised': 'supervised_eval'}
+
+
+def load_grad_conflict(seeds):
+    """Pull grad_conflict_frac + grad_cos_mean (overall, not per-component)
+    per (encoder, seed, iteration) from the training-time projects.
+
+    Coarse by construction: log_grad_conflict fires at eval_freq cadence
+    (~6 points over a 3M-step run), so this is a summary-comparison signal,
+    not a dense curve.
+    """
+    import wandb
+    api = wandb.Api()
+    keys = ['pretrain/iteration', 'pretrain/grad_conflict_frac', 'pretrain/grad_cos_mean']
+    rows = []
+    for enc, project in GRAD_CONFLICT_PROJECTS.items():
+        for run in api.runs(f'{ENTITY}/{project}'):
+            seed = run.config.get('seed')
+            if seed not in seeds:
+                continue
+            present = [k for k in keys if k == 'pretrain/iteration' or k in run.summary.keys()]
+            if len(present) <= 1:
+                continue
+            hist = run.history(keys=present, pandas=True)
+            if hist is None or hist.empty:
+                continue
+            for _, r in hist.iterrows():
+                it = r.get('pretrain/iteration')
+                gc = r.get('pretrain/grad_conflict_frac')
+                cos = r.get('pretrain/grad_cos_mean')
+                if pd.isna(it) or pd.isna(gc):
+                    continue
+                rows.append((enc, int(seed), int(it), float(gc),
+                            float(cos) if not pd.isna(cos) else np.nan))
+    df = pd.DataFrame(rows, columns=['encoder', 'seed', 'iteration', 'grad_conflict_frac', 'grad_cos_mean'])
+    return df.drop_duplicates(['encoder', 'seed', 'iteration'], keep='last')
+
+
+def grad_conflict_summary(gc_df, n_boot, args, tail_n=5):
+    """Per-encoder grad-conflict summary (seed-only bootstrap -- these are
+    per-run scalars, no task axis) + a per-iteration table for the curve plot.
+
+    grad_conflict_frac is quantized: grad_conflict_tasks=6 -> C(6,2)=15 task
+    pairs -> only 15 possible values (multiples of 1/15). A single final
+    checkpoint is therefore a noisy summary (ties across seeds are common by
+    construction, not a sign of a data bug) -- report the mean over the last
+    `tail_n` checkpoints per seed instead, which averages out the quantization.
+    """
+    if gc_df.empty:
+        print('\n[skip grad-conflict] no rows loaded')
+        return None
+    rows = []
+    for enc in ENCODERS:
+        d = gc_df[gc_df.encoder == enc]
+        if d.empty:
+            continue
+        tail_vals = []
+        for seed, g in d.groupby('seed'):
+            g = g.sort_values('iteration')
+            tail_vals.append(g.grad_conflict_frac.tail(tail_n).mean())
+        vals = np.array(tail_vals)
+        point, lo, hi = stratified_bootstrap_ci(vals.reshape(-1, 1), agg=iqm,
+                                                n_boot=n_boot, seed=args.seed)
+        rows.append({'encoder': enc, 'iteration': f'last {tail_n} ckpts (mean)',
+                     'iqm_grad_conflict_frac': point, 'ci_lo': lo, 'ci_hi': hi,
+                     'n_seeds': len(vals)})
+    summary = pd.DataFrame(rows)
+    print(f'\n=== Gradient-conflict fraction, tail average (last {tail_n} checkpoints/seed, IQM over seeds) ===')
+    print('    (grad_conflict_frac is quantized to multiples of 1/15 -- a single checkpoint is a noisy point estimate)')
+    print(summary.to_string(index=False, float_format=lambda x: f'{x:.3f}'))
+
+    curve_rows = []
+    for enc in ENCODERS:
+        d = gc_df[gc_df.encoder == enc]
+        for it in sorted(d.iteration.unique()):
+            vals = d[d.iteration == it].grad_conflict_frac.to_numpy()
+            if len(vals) == 0:
+                continue
+            point, lo, hi = stratified_bootstrap_ci(vals.reshape(-1, 1), agg=iqm,
+                                                    n_boot=n_boot, seed=args.seed)
+            curve_rows.append({'encoder': enc, 'iteration': it,
+                               'iqm_grad_conflict_frac': point, 'ci_lo': lo, 'ci_hi': hi})
+    curve = pd.DataFrame(curve_rows)
+    curve.to_csv(args.outdir / 'grad_conflict_curve.csv', index=False)
+    print(f'Wrote {args.outdir / "grad_conflict_curve.csv"} ({len(curve)} points)')
+    return summary
+
+
 def load_experts(experts_dir, tasks):
     """Per-task published TD-MPC2 single-task expert return (raw dm_control).
 
@@ -472,6 +655,14 @@ def main():
                     help='also pull sweep-scenario returns and emit the dose-response curve')
     ap.add_argument('--sweep-cache', type=Path, default=None,
                     help='parquet cache for the (heavier) scenario pull')
+    ap.add_argument('--grad-conflict', action='store_true',
+                    help='also pull grad_conflict_frac from the training-time projects '
+                        f'({GRAD_CONFLICT_PROJECTS}) and emit a summary + sparse curve')
+    ap.add_argument('--grad-conflict-cache', type=Path, default=None)
+    ap.add_argument('--model-error', action='store_true',
+                    help='also pull consistency_error/reward_error from the secondrun_* '
+                        'backfill projects and emit a summary + curve')
+    ap.add_argument('--model-error-cache', type=Path, default=None)
     args = ap.parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
     projects = {'task_id': args.taskid_project, 'supervised': args.supervised_project}
@@ -505,6 +696,29 @@ def main():
             print('[skip sweep] no scenario rows loaded')
         else:
             sweep_curve(scen, args.tasks, args.n_boot, args)
+
+    if args.grad_conflict:
+        seeds = set(df.seed.unique().tolist())
+        if args.grad_conflict_cache and args.grad_conflict_cache.exists():
+            print(f'\nLoading cached grad-conflict frame {args.grad_conflict_cache}')
+            gc_df = pd.read_parquet(args.grad_conflict_cache)
+        else:
+            gc_df = load_grad_conflict(seeds)
+            if args.grad_conflict_cache:
+                gc_df.to_parquet(args.grad_conflict_cache)
+                print(f'Cached grad-conflict frame -> {args.grad_conflict_cache}')
+        grad_conflict_summary(gc_df, args.n_boot, args)
+
+    if args.model_error:
+        if args.model_error_cache and args.model_error_cache.exists():
+            print(f'\nLoading cached model-error frame {args.model_error_cache}')
+            me_df = pd.read_parquet(args.model_error_cache)
+        else:
+            me_df = load_model_error(args.tasks)
+            if args.model_error_cache:
+                me_df.to_parquet(args.model_error_cache)
+                print(f'Cached model-error frame -> {args.model_error_cache}')
+        model_error_summary(me_df, args.tasks, args.n_boot, args)
 
 
 if __name__ == '__main__':
