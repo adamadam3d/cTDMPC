@@ -24,8 +24,11 @@ aggregate.py flag first -- see each fig_* function's docstring for which):
   F. fig_model_error        held-out consistency_error / reward_error under
                             CARL context shift, from the secondrun_* backfill
                             (the one thing those projects are ground truth for).
-
-Not yet built: the context-recovery scatter (needs the probe, TODO #3).
+  G. fig_context_recovery   RQ1: median cross-validated linear-probe R^2 of ẑ
+                            -> each physical context dim, supervised vs the
+                            task_id negative control (from probe_recovery.py).
+                            SKIPPED until the probe (TODO #3) has been run --
+                            no data exists yet.
 
 Design follows the dataviz skill: categorical hues assigned by ENTITY and held
 stable across all figures (blue=task_id, aqua=supervised), thin marks, recessive
@@ -305,6 +308,48 @@ def fig_model_error(curve_csv, out_stem, fmt):
     return _save(fig, out_stem, fmt)
 
 
+def fig_context_recovery(r2_csv, out_stem, fmt):
+    """RQ1 headline (from probe_recovery.py): median cross-validated linear-probe
+    R^2 of ẑ -> each physical context dimension, supervised vs task_id. task_id
+    is the negative control (fixed per-task embedding -> R^2 ~ 0 by construction);
+    a supervised bar clearly above 0 is the evidence that the context encoder
+    recovers physical structure it was never supervised on.
+
+    Input probe_r2_median.csv: index=context_feature, columns per encoder.
+    """
+    df = pd.read_csv(r2_csv, index_col=0)
+    have = [e for e in ('task_id', 'supervised') if e in df.columns]
+    df = df.sort_values(have[-1] if have else df.columns[-1], ascending=True)
+    feats = df.index.tolist()
+    y = np.arange(len(feats))
+    h = 0.38
+    fig, ax = plt.subplots(figsize=(7.5, max(3.0, 0.5 * len(feats) + 1.5)))
+    if 'supervised' in df.columns:
+        ax.barh(y + h/2 + 0.02, df['supervised'].clip(lower=0), height=h,
+                color=C['supervised'], label=LABEL['supervised'])
+    if 'task_id' in df.columns:
+        ax.barh(y - h/2 - 0.02, df['task_id'].clip(lower=0), height=h,
+                color=C['task_id'], label=LABEL['task_id'])
+    for enc, off in (('supervised', h/2 + 0.02), ('task_id', -h/2 - 0.02)):
+        if enc in df.columns:
+            for yi, v in zip(y + off, df[enc]):
+                ax.text(max(v, 0) + 0.01, yi, f'{v:.2f}', va='center', ha='left',
+                        color=C['ink2'], fontsize=8)
+    ax.axvline(0.0, color=C['axis'], linewidth=0.8)
+    ax.set_yticks(y)
+    ax.set_yticklabels(feats, color=C['ink2'], fontsize=9)
+    ax.set_xlabel('median cross-validated linear-probe R² (ẑ → physical context dim)')
+    ax.set_title('Context recovery: does ẑ encode the physical context it was never trained on?',
+                 fontsize=11, loc='left', pad=10)
+    ax.grid(axis='y', visible=False)
+    ax.set_xlim(left=min(0, float(df.min().min()) - 0.02))
+    leg = ax.legend(loc='lower right', frameon=False, fontsize=9)
+    for t in leg.get_texts():
+        t.set_color(C['ink2'])
+    fig.tight_layout()
+    return _save(fig, out_stem, fmt)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -346,6 +391,12 @@ def main():
         made += fig_model_error(me, str(args.outdir / 'fig_model_error'), args.format)
     else:
         print(f'[skip] {me} not found -- run aggregate.py --model-error first')
+    cr = args.indir / 'probe_r2_median.csv'
+    if cr.exists():
+        made += fig_context_recovery(cr, str(args.outdir / 'fig_context_recovery'), args.format)
+    else:
+        print(f'[skip] {cr} not found -- NO PROBE DATA yet '
+              '(launch eval_carl_probe_taskid_supervised.sh, then run probe_recovery.py)')
     print('Wrote:')
     for f in made:
         print(' ', f)
