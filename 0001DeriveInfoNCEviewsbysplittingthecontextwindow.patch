@@ -1,0 +1,74 @@
+From 2947beceffd27347a61bd5f18459e0a03e1bcefd Mon Sep 17 00:00:00 2001
+From: adamadam3d <adam.adam2004d@gmail.com>
+Date: Thu, 2 Jul 2026 23:42:06 +0000
+Subject: [PATCH] Derive InfoNCE views by splitting the context window instead
+ of resampling
+
+The supervised-NCE encoder previously drew a second independent context
+window (ctx2) via buffer.sample_context on every update, doubling the
+per-iteration context gather -- an expensive random-access read of
+B*num_context rows from (typically CPU-resident) replay storage that runs
+serially with the GPU step. Since the set-based sampler draws tuples
+i.i.d. within a task, two halves of one window are distributionally
+equivalent to two independent windows, so split the existing window into
+two views for the contrastive loss instead. World-model conditioning
+(z_ctx) still uses the full-window embedding, and all other encoders
+(task_id, pearl, varibad, supervised-CE) are unaffected.
+---
+ tdmpc2/tdmpc2.py | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/tdmpc2/tdmpc2.py b/tdmpc2/tdmpc2.py
+index f6da14f..e63f3a2 100755
+--- a/tdmpc2/tdmpc2.py
++++ b/tdmpc2/tdmpc2.py
+@@ -42,6 +42,9 @@ class TDMPC2(torch.nn.Module):
+ 		print('Discount factor:', self.discount)
+ 		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
+ 		if cfg.multitask:
++			if cfg.context_encoder == 'supervised' and cfg.context_loss == 'nce':
++				assert cfg.num_context >= 2, \
++					'InfoNCE splits the context window into two views; num_context must be >= 2.'
+ 			# Online context state for inference during rollouts, per encoder.
+ 			ctx_dim = 2*cfg.obs_shape['state'][0] + cfg.action_dim + 1
+ 			if cfg.context_encoder == 'task_id':
+@@ -427,7 +430,7 @@ class TDMPC2(torch.nn.Module):
+ 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
+ 		return reward + discount * (1-terminated) * self.model.Q(next_z, action, z_ctx, return_type='min', target=True)
+ 
+-	def _update(self, obs, action, reward, terminated, task=None, ctx=None, ctx2=None):
++	def _update(self, obs, action, reward, terminated, task=None, ctx=None):
+ 		# Switch to train mode before any forward pass that participates in the
+ 		# backward graph. The varibad belief rollout uses a cuDNN RNN, whose
+ 		# backward can only be called if its forward ran in training mode.
+@@ -502,7 +505,16 @@ class TDMPC2(torch.nn.Module):
+ 			ctx_reg = self.cfg.kl_coef * kl_loss
+ 		elif self.cfg.multitask and self.cfg.context_encoder == 'supervised':
+ 			if self.cfg.context_loss == 'nce':
+-				context_loss = math.info_nce(z_ctx, self.model.infer_ctx(ctx2), task, self.cfg.nce_temp)
++				# Two contrastive views from independent halves of the same
++				# context window. The set-based sampler draws tuples i.i.d.
++				# within a task, so the halves are distributionally equivalent
++				# to two independent windows, at half the sampling cost (no
++				# second sample_context gather per update). z_ctx conditioning
++				# of the world model stays the full-window embedding.
++				ctx_a, ctx_b = ctx.chunk(2, dim=-2)
++				context_loss = math.info_nce(
++					self.model.infer_ctx(ctx_a), self.model.infer_ctx(ctx_b),
++					task, self.cfg.nce_temp)
+ 			else:
+ 				task_logits = self.model.classify_ctx(z_ctx)
+ 				context_loss = F.cross_entropy(task_logits, task)
+@@ -576,9 +588,6 @@ class TDMPC2(torch.nn.Module):
+ 		if task is not None:
+ 			kwargs["task"] = task
+ 			kwargs["ctx"] = ctx
+-			if self.cfg.context_encoder == 'supervised' and self.cfg.context_loss == 'nce':
+-				# Independent second window per task for contrastive positives.
+-				kwargs["ctx2"] = buffer.sample_context(task)
+ 		torch.compiler.cudagraph_mark_step_begin()
+ 		return self._update(obs, action, reward, terminated, **kwargs)
+ 
+-- 
+2.43.0
+

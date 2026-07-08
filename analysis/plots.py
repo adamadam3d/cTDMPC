@@ -318,6 +318,9 @@ def fig_context_recovery(r2_csv, out_stem, fmt):
     Input probe_r2_median.csv: index=context_feature, columns per encoder.
     """
     df = pd.read_csv(r2_csv, index_col=0)
+    # Drop dimensions with no defined R^2 for either encoder (e.g. timestep,
+    # which CARL never perturbs -> zero true within-task variance -> nan).
+    df = df.dropna(how='all')
     have = [e for e in ('task_id', 'supervised') if e in df.columns]
     df = df.sort_values(have[-1] if have else df.columns[-1], ascending=True)
     feats = df.index.tolist()

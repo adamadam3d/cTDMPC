@@ -123,7 +123,12 @@ def cv_r2(X, y, n_splits=5, seed=0):
     undefined, which IS the expected negative-control result, not an error).
     """
     n = len(y)
-    if n < n_splits or np.nanstd(y) == 0:
+    # Tolerance, not ==0: a feature CARL never perturbs within a task (e.g.
+    # timestep) has zero TRUE variance but nonzero floating-point noise, which
+    # let RidgeCV fit that noise and report a spurious high R^2 for BOTH
+    # encoders (caught: timestep showed 0.75 for task_id, which must be ~0).
+    y_mean_abs = np.nanmean(np.abs(y)) or 1.0
+    if n < n_splits or np.nanstd(y) < 1e-8 * y_mean_abs:
         return np.nan
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
     preds = np.full(n, np.nan)
@@ -207,7 +212,7 @@ def summarize_silhouette(sil_df, outdir):
         print('[skip] no silhouette rows computed')
         return
     sil_df.to_csv(outdir / 'probe_silhouette.csv', index=False)
-    print('\n=== Silhouette score (ẑ pooled across tasks, labeled by task) ===')
+    print('\n=== Silhouette score (z pooled across tasks, labeled by task) ===')
     print(sil_df.to_string(index=False, float_format=lambda x: f'{x:.3f}'))
     print(f'Wrote {outdir / "probe_silhouette.csv"}')
 
